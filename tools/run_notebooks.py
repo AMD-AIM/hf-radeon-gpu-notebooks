@@ -107,21 +107,43 @@ for _n in ("AutoModelForCausalLM", "AutoModelForMultimodalLM",
             return orig(cls, *a, **k)
         return _fp
     _c.from_pretrained = _mk(_orig_fp)
-# ROCm torchvision is built WITHOUT libjpeg, so decode_jpeg() raises. VL
-# pipelines call it internally to load images -> fall back to PIL.
+# ROCm torchvision is built WITHOUT libjpeg, so decode_jpeg/decode_image/
+# read_image raise. VL pipelines call them internally to load images, so we
+# wrap ALL THREE entry points with a PIL fallback (covers every code path that
+# decodes a JPEG inside transformers / qwen_vl_utils / etc.).
 try:
     import torch as _torch, torchvision.io as _tvio
     from PIL import Image as _PILImage
     import io as _io, numpy as _np
-    _orig_dj = _tvio.decode_jpeg
-    def _ci_decode_jpeg(_inp, *_a, **_k):
-        try:
-            return _orig_dj(_inp, *_a, **_k)
-        except Exception:
-            _buf = bytes(_inp.cpu().numpy().tobytes()) if hasattr(_inp, "cpu") else bytes(_inp)
-            _im = _PILImage.open(_io.BytesIO(_buf)).convert("RGB")
-            return _torch.from_numpy(_np.array(_im)).permute(2, 0, 1).contiguous()
-    _tvio.decode_jpeg = _ci_decode_jpeg
+
+    def _pil_to_chw(_buf):
+        _im = _PILImage.open(_io.BytesIO(_buf)).convert("RGB")
+        return _torch.from_numpy(_np.array(_im)).permute(2, 0, 1).contiguous()
+
+    def _as_bytes(_inp):
+        return bytes(_inp.cpu().numpy().tobytes()) if hasattr(_inp, "cpu") else bytes(_inp)
+
+    def _wrap_decode(_orig):
+        def _w(_inp, *_a, **_k):
+            try:
+                return _orig(_inp, *_a, **_k)
+            except Exception:
+                return _pil_to_chw(_as_bytes(_inp))
+        return _w
+
+    for _name in ("decode_jpeg", "decode_image"):
+        if hasattr(_tvio, _name):
+            setattr(_tvio, _name, _wrap_decode(getattr(_tvio, _name)))
+
+    if hasattr(_tvio, "read_image"):
+        _orig_ri = _tvio.read_image
+        def _ci_read_image(_path, *_a, **_k):
+            try:
+                return _orig_ri(_path, *_a, **_k)
+            except Exception:
+                with open(_path, "rb") as _fh:
+                    return _pil_to_chw(_fh.read())
+        _tvio.read_image = _ci_read_image
 except Exception:
     pass
 print("[ci-normalize] applied")
