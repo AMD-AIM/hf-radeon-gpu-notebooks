@@ -306,7 +306,25 @@ from nbclient import NotebookClient
 REPO = Path(__file__).resolve().parents[1]
 NB_DIR = REPO / "original_notebooks"
 MAP_CSV = REPO / "doc" / "model_path_mapping.csv"
+SOURCE_DATA = REPO / "source_data"        # locally-cached notebook web resources
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def load_resource_map():
+    """url -> absolute local path, for web images/audio pre-downloaded to
+    source_data/ (so notebooks never fetch them at run time)."""
+    rm = SOURCE_DATA / "resource_map.json"
+    out = {}
+    try:
+        for url, name in json.loads(rm.read_text()).items():
+            if name:
+                out[url] = str(SOURCE_DATA / name)
+    except Exception:
+        pass
+    return out
+
+
+RESOURCE_MAP = load_resource_map()
 
 # Host-local secrets / proxy config (HF_TOKEN, HF_ENDPOINT, ...). Lives OUTSIDE
 # the repo so it is never committed, never uploaded, and survives
@@ -429,6 +447,9 @@ def patch_notebook(nb, model_id, local_path, keep_pip):
                 lines.append(ln)
             src = "\n".join(lines)
             src = src.replace(model_id, local_path)          # core path rewrite
+            for _url, _local in RESOURCE_MAP.items():        # web asset -> local
+                if _url in src:
+                    src = src.replace(_url, _local)
             if not vl:                                       # text model fix
                 src = src.replace("AutoModelForMultimodalLM",
                                   "AutoModelForCausalLM")
@@ -1251,5 +1272,7 @@ result capture all work end-to-end.
 | `doc/model_path_mapping.csv`          | generated id→path map the runner consumes   |
 | `tools/build_model_path_mapping.py`   | regenerates the map (§6.2)                   |
 | `tools/run_notebooks.py`              | the executor (§6.1)                          |
+| `tools/fetch_source_data.py`          | pre-downloads notebook web assets to `source_data/` |
+| `source_data/*`                       | local copies of notebook images/audio + `resource_map.json` |
 | `.github/workflows/radeon-local-notebook-ci.yml` | the CI entrypoint (§6.3)         |
 | `scripts/start_ci_container.sh`       | persistent dev container launcher (§5.1)    |
