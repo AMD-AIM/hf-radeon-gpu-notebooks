@@ -96,6 +96,15 @@ OFFLINE_BAD = re.compile(
     r"router\.huggingface\.co|from openai import|OpenAI\(|YOUR_TOKEN_HERE"
     r"|huggingface_hub import login|login\(\)|from google\.colab")
 PIP_RE = re.compile(r"^\s*[%!]?\s*pip\s+install", re.I)
+# Defensive: notebooks often reset HF_TOKEN to a placeholder
+# (e.g. os.environ['HF_TOKEN'] = 'YOUR_TOKEN_HERE') or override the endpoint /
+# offline flags. Such a line would clobber the host-local env we injected. We
+# comment out ONLY those lines so the rest of the cell still runs.
+ENV_GUARD = re.compile(
+    r"""^\s*(?:os\.)?environ\s*\[\s*['"]"""
+    r"""(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HUGGINGFACEHUB_API_TOKEN|HF_ENDPOINT"""
+    r"""|HF_HUB_OFFLINE|TRANSFORMERS_OFFLINE|HF_HUB_DISABLE_XET|HTTP_PROXY"""
+    r"""|HTTPS_PROXY|http_proxy|https_proxy)['"]\s*\]\s*=""")
 VL_KEYS = ("vl", "vision", "image", "multimodal", "omni", "clip", "siglip",
            "janus", "ocr", "mllama", "idefics", "internvl", "gemma3",
            "minicpm_v", "minicpmo")
@@ -137,6 +146,8 @@ def patch_notebook(nb, model_id, local_path, keep_pip):
             for ln in src.splitlines():
                 if not keep_pip and PIP_RE.match(ln):
                     ln = "# [ci-skip pip] " + ln
+                elif ENV_GUARD.match(ln):
+                    ln = "# [ci-protect env] " + ln
                 lines.append(ln)
             src = "\n".join(lines)
             src = src.replace(model_id, local_path)          # core path rewrite
