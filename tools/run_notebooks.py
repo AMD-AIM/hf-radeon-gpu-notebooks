@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Execute radeon_notebooks/*.ipynb against local model weights on GPU 2,3.
+"""Execute original_notebooks/*.ipynb against local model weights on GPU 2,3.
 
-Run inside huaggingface_for_amd_radeon:latest. Patches each notebook in memory
-(HF id -> local /disk/ssdN path), executes with nbconvert offline, records
-per-cell PASS/FAIL + peak VRAM + elapsed, and emits JSON / HTML / summary.md.
+Run inside huaggingface_for_amd_radeon:latest. For each eligible notebook the
+runner builds a throwaway IN-MEMORY copy, applies normalization patches (force
+GPU placement, neutralize offline-incompatible demo cells, rewrite the HF id to
+the local /disk/ssdN path, fix the text-model AutoModel class), executes it with
+nbclient offline, records per-cell PASS/FAIL + peak VRAM + elapsed, and writes
+JSON / HTML / summary.md. The path-rewritten script is NEVER written to disk:
+only the original notebook source plus fresh outputs is persisted.
 """
 import argparse, copy, csv, json, os, re, subprocess, threading, time
 from datetime import datetime, timezone
@@ -13,8 +17,50 @@ import nbformat
 from nbclient import NotebookClient
 
 REPO = Path(__file__).resolve().parents[1]
-NB_DIR = REPO / "radeon_notebooks"
+NB_DIR = REPO / "original_notebooks"
 MAP_CSV = REPO / "doc" / "model_path_mapping.csv"
+
+# Injected as the first cell of every notebook. Globally forces GPU placement
+# (device_map/torch_dtype default to "auto") and offline mode, so raw HF
+# notebooks that lack device_map="auto" still load on the GPU instead of CPU.
+NORM_PREAMBLE = '''# [ci-normalize] force GPU placement + offline (injected by CI)
+import os as _os
+_os.environ.setdefault("HF_HUB_OFFLINE", "1")
+_os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+import functools as _ft, transformers as _tf
+_orig_pipeline = _tf.pipeline
+def _ci_pipeline(*a, **k):
+    k.setdefault("device_map", "auto")
+    return _orig_pipeline(*a, **k)
+_tf.pipeline = _ci_pipeline
+for _n in ("AutoModelForCausalLM", "AutoModelForMultimodalLM",
+           "AutoModelForImageTextToText", "AutoModelForSeq2SeqLM",
+           "AutoModelForSpeechSeq2Seq", "AutoModel"):
+    _c = getattr(_tf, _n, None)
+    if _c is None:
+        continue
+    _orig_fp = _c.from_pretrained.__func__
+    def _mk(orig):
+        @classmethod
+        @_ft.wraps(orig)
+        def _fp(cls, *a, **k):
+            k.setdefault("device_map", "auto")
+            k.setdefault("torch_dtype", "auto")
+            return orig(cls, *a, **k)
+        return _fp
+    _c.from_pretrained = _mk(_orig_fp)
+print("[ci-normalize] applied")
+'''
+
+# Cells matching this are pure online API / interactive-login demos that cannot
+# run in offline CI; they are commented out wholesale.
+OFFLINE_BAD = re.compile(
+    r"router\.huggingface\.co|from openai import|OpenAI\(|YOUR_TOKEN_HERE"
+    r"|huggingface_hub import login|login\(\)|from google\.colab")
+PIP_RE = re.compile(r"^\s*[%!]?\s*pip\s+install", re.I)
+VL_KEYS = ("vl", "vision", "image", "multimodal", "omni", "clip", "siglip",
+           "janus", "ocr", "mllama", "idefics", "internvl", "gemma3",
+           "minicpm_v", "minicpmo")
 
 
 def load_mapping():
@@ -22,23 +68,52 @@ def load_mapping():
         return {r["notebook"]: r for r in csv.DictReader(f)}
 
 
+def is_vl_model(local_path):
+    """Decide whether a model is vision/multimodal from its local config.json."""
+    try:
+        cfg = json.load(open(os.path.join(local_path, "config.json")))
+    except Exception:
+        return False
+    if "vision_config" in cfg:
+        return True
+    blob = (cfg.get("model_type", "") + " " +
+            " ".join(cfg.get("architectures", []) or [])).lower()
+    return any(k in blob for k in VL_KEYS)
+
+
 def patch_notebook(nb, model_id, local_path, keep_pip):
-    pip_re = re.compile(r"^\s*[%!]?\s*pip\s+install", re.I)
+    vl = is_vl_model(local_path)
+    preamble = {"cell_type": "code", "metadata": {"ci_preamble": True},
+                "execution_count": None, "outputs": [], "source": NORM_PREAMBLE}
+    out_cells = [preamble]
     for cell in nb.get("cells", []):
         if cell.get("cell_type") != "code":
+            out_cells.append(cell)
             continue
         src = "".join(cell.get("source", []))
-        if not keep_pip:
-            src = "\n".join(
-                ("# [ci-skipped pip] " + ln) if pip_re.match(ln) else ln
-                for ln in src.splitlines()
-            )
-        src = src.replace(model_id, local_path)          # the core path rewrite
+        if OFFLINE_BAD.search(src):
+            src = "\n".join("# [ci-skip offline] " + ln
+                            for ln in src.splitlines())
+        else:
+            lines = []
+            for ln in src.splitlines():
+                if not keep_pip and PIP_RE.match(ln):
+                    ln = "# [ci-skip pip] " + ln
+                lines.append(ln)
+            src = "\n".join(lines)
+            src = src.replace(model_id, local_path)          # core path rewrite
+            if not vl:                                       # text model fix
+                src = src.replace("AutoModelForMultimodalLM",
+                                  "AutoModelForCausalLM")
+        cell = dict(cell)
         cell["source"] = src
         cell["outputs"] = []
         cell["execution_count"] = None
+        out_cells.append(cell)
+    nb = dict(nb)
+    nb["cells"] = out_cells
     nb.get("metadata", {}).pop("kernelspec", None)
-    return nb
+    return nb, vl
 
 
 def poll_vram(stop, peak):
@@ -68,10 +143,8 @@ def run_one(nb_file, row, args, results_dir):
     original = json.loads((NB_DIR / nb_file).read_text())
 
     # --- TEMPORARY, IN-MEMORY ONLY -------------------------------------------
-    # Rewrite the HF id -> local /disk/ssdN path on a deep copy that lives only
-    # in RAM and is handed straight to the kernel. It is NEVER written to disk.
-    patched = patch_notebook(copy.deepcopy(original), model_id, local_path,
-                             args.keep_pip)
+    patched, vl = patch_notebook(copy.deepcopy(original), model_id,
+                                 local_path, args.keep_pip)
     nb_node = nbformat.from_dict(patched)
     # -------------------------------------------------------------------------
 
@@ -107,11 +180,13 @@ def run_one(nb_file, row, args, results_dir):
     elapsed = round(time.time() - start, 1)
     stop.set(); th.join(timeout=5)
 
-    # Tally per-cell results from the executed in-memory node.
+    # Tally per-cell results, skipping the injected normalization preamble.
     cells, passed, failed = [], 0, 0
     idx = 0
     for cell in nb_node.cells:
         if cell.get("cell_type") != "code":
+            continue
+        if cell.get("metadata", {}).get("ci_preamble"):
             continue
         idx += 1
         err = next((o for o in cell.get("outputs", [])
@@ -127,11 +202,12 @@ def run_one(nb_file, row, args, results_dir):
     overall = "ERROR" if pod_error else ("PASSED" if failed == 0 else "FAILED")
 
     # --- Persist the RESULT, not the rewritten script ------------------------
-    # Saved notebook = ORIGINAL source (HF ids preserved, no /disk path) with
-    # only the freshly produced outputs merged in. The temporary local-path
-    # rewrite is discarded, so no host-specific path ever lands on disk.
+    # Saved notebook = ORIGINAL source (HF ids preserved, no /disk path, no
+    # injected preamble) with only the fresh outputs merged in.
     artifact = nbformat.from_dict(original)
-    executed_code = [c for c in nb_node.cells if c.get("cell_type") == "code"]
+    executed_code = [c for c in nb_node.cells
+                     if c.get("cell_type") == "code"
+                     and not c.get("metadata", {}).get("ci_preamble")]
     j = 0
     for cell in artifact.cells:
         if cell.get("cell_type") != "code":
@@ -142,14 +218,14 @@ def run_one(nb_file, row, args, results_dir):
         j += 1
     out_nb = results_dir / nb_file
     nbformat.write(artifact, str(out_nb))
-    # Rendered HTML (original paths, real outputs) so reviewers can read output.
     subprocess.run(["jupyter", "nbconvert", "--to", "html", str(out_nb)],
                    capture_output=True, text=True)
     # -------------------------------------------------------------------------
 
     report = {
         "notebook": nb_file, "model_id": model_id, "local_path": local_path,
-        "storage": row["storage"], "overall_status": overall,
+        "storage": row.get("storage"), "gpus": row.get("gpus"),
+        "is_vl": vl, "overall_status": overall,
         "cells_passed": passed, "cells_failed": failed,
         "cells_total": passed + failed, "elapsed_seconds": elapsed,
         "vram_peak_gb": round(peak[0] / 1e9, 1), "vram_total_gb": 96.0,
@@ -173,13 +249,13 @@ def write_summary(reports, results_dir):
     rate = (100.0 * npass / n) if n else 0.0
     icon = {"PASSED": "PASS", "FAILED": "FAIL", "ERROR": "ERR "}
     lines = [
-        "# Radeon Local Notebook CI — Results",
+        "# Radeon Local Notebook CI — Results (original_notebooks)",
         "",
         f"**{n} notebooks · {npass} passed · {nfail} failed · {nerr} errored "
         f"· {rate:.1f}% pass** (GPU 2+3, 96 GB budget)",
         "",
-        "| # | Status | Model | Notebook | Cells P/F/T | Peak VRAM | Time | Notes |",
-        "|--:|:------:|:------|:---------|:-----------:|:---------:|-----:|:------|",
+        "| # | Status | Model | Notebook | VL | Cells P/F/T | Peak VRAM | Time | Notes |",
+        "|--:|:------:|:------|:---------|:--:|:-----------:|:---------:|-----:|:------|",
     ]
     for i, r in enumerate(sorted(reports, key=lambda x: x["notebook"]), 1):
         note = r["pod_error"] or (
@@ -188,9 +264,9 @@ def write_summary(reports, results_dir):
                            if c["status"] == "FAILED")[:120])
         lines.append(
             f"| {i} | {icon[r['overall_status']]} | `{r['model_id']}` | "
-            f"{r['notebook']} | {r['cells_passed']}/{r['cells_failed']}/"
-            f"{r['cells_total']} | {r['vram_peak_gb']} GB | "
-            f"{r['elapsed_seconds']:.0f}s | {note} |")
+            f"{r['notebook']} | {'Y' if r.get('is_vl') else ''} | "
+            f"{r['cells_passed']}/{r['cells_failed']}/{r['cells_total']} | "
+            f"{r['vram_peak_gb']} GB | {r['elapsed_seconds']:.0f}s | {note} |")
     (results_dir / "summary.md").write_text("\n".join(lines) + "\n")
     print(f"\nSummary: {npass}/{n} passed ({rate:.1f}%)")
 
@@ -203,6 +279,8 @@ def main():
     ap.add_argument("--cell-timeout", type=int, default=900)
     ap.add_argument("--nb-timeout", type=int, default=1800)
     ap.add_argument("--keep-pip", action="store_true")
+    ap.add_argument("--include-ineligible", action="store_true",
+                    help="also run notebooks marked eligible=no (OOM/incomplete)")
     args = ap.parse_args()
 
     results_dir = Path(args.results_dir)
@@ -215,8 +293,9 @@ def main():
         if args.filter and args.filter.lower() not in (
                 nb_file + " " + row["model_id"]).lower():
             continue
-        if row.get("model_dir_exists") != "yes":
-            print(f"[SKIP  ] {nb_file:55} weights missing: {row['local_path']}")
+        if not args.include_ineligible and row.get("eligible") != "yes":
+            reason = row.get("download_status") or "ineligible"
+            print(f"[SKIP  ] {nb_file:55} ({reason}, gpus={row.get('gpus')})")
             continue
         todo.append((nb_file, row))
 

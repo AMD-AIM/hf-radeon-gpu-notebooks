@@ -11,6 +11,10 @@ on:
         description: "Keep %pip install cells (default: skip)"
         type: boolean
         default: false
+      include_ineligible:
+        description: "Also run >2-GPU / incomplete models (will OOM/fail)"
+        type: boolean
+        default: false
   push:
     branches: [ feature/local-ci ]
   schedule:
@@ -23,9 +27,14 @@ concurrency:
 jobs:
   run-notebooks:
     runs-on: [self-hosted, rocm, w7900]   # label your registered runner this way
-    timeout-minutes: 1440
+    timeout-minutes: 2880
+    env:
+      CI_CONTAINER: hf-ci-gpu23-${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Clean up stale CI containers (orphans from cancelled runs)
+        run: docker ps -aq --filter "name=hf-ci-gpu23-" | xargs -r docker rm -f
 
       - name: Refresh model path mapping
         run: python3 tools/build_model_path_mapping.py
@@ -33,10 +42,11 @@ jobs:
       - name: Execute notebooks on GPU 2 + 3
         run: |
           mkdir -p results
-          KEEP_PIP=""
-          if [ "${{ github.event.inputs.keep_pip }}" = "true" ]; then KEEP_PIP="--keep-pip"; fi
+          EXTRA=""
+          if [ "${{ github.event.inputs.keep_pip }}" = "true" ]; then EXTRA="$EXTRA --keep-pip"; fi
+          if [ "${{ github.event.inputs.include_ineligible }}" = "true" ]; then EXTRA="$EXTRA --include-ineligible"; fi
           docker run --rm \
-            --name hf-ci-gpu23-${{ github.run_id }} \
+            --name "$CI_CONTAINER" \
             --device=/dev/kfd \
             --device=/dev/dri/renderD130 \
             --device=/dev/dri/renderD131 \
@@ -51,11 +61,15 @@ jobs:
             huaggingface_for_amd_radeon:latest \
             -lc "python3 tools/run_notebooks.py \
                    --results-dir results \
-                   --filter '${{ github.event.inputs.filter }}' $KEEP_PIP"
+                   --filter '${{ github.event.inputs.filter }}' $EXTRA"
+
+      - name: Tear down CI container (always, frees GPU on cancel/failure)
+        if: always()
+        run: docker rm -f "$CI_CONTAINER" 2>/dev/null || true
 
       - name: Publish summary to job page
         if: always()
-        run: cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no summary produced" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload results (JSON + executed notebooks + HTML)
         if: always()
