@@ -281,6 +281,9 @@ def main():
     ap.add_argument("--keep-pip", action="store_true")
     ap.add_argument("--include-ineligible", action="store_true",
                     help="also run notebooks marked eligible=no (OOM/incomplete)")
+    ap.add_argument("--order", choices=["size", "name"], default="size",
+                    help="run order: 'size' = smallest model first (fast early "
+                         "progress, default); 'name' = filename order")
     args = ap.parse_args()
 
     results_dir = Path(args.results_dir)
@@ -298,6 +301,16 @@ def main():
             print(f"[SKIP  ] {nb_file:55} ({reason}, gpus={row.get('gpus')})")
             continue
         todo.append((nb_file, row))
+
+    if args.order == "size":
+        def _sz(item):
+            lp = item[1].get("local_path", "")
+            try:
+                return sum(f.stat().st_size for f in Path(lp).rglob("*")
+                           if f.is_file())
+            except Exception:
+                return float("inf")
+        todo.sort(key=_sz)
 
     total = len(todo)
     print(f"Running {total} notebook(s) on GPU 2+3 ...\n", flush=True)
