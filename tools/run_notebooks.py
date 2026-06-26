@@ -237,7 +237,7 @@ def run_one(nb_file, row, args, results_dir):
     print(f"[{overall:6}] {nb_file:55} "
           f"cells {passed}/{passed + failed}  "
           f"{report['vram_peak_gb']:>5} GB  {elapsed:>6}s"
-          + (f"  ({pod_error})" if pod_error else ""))
+          + (f"  ({pod_error})" if pod_error else ""), flush=True)
     return report
 
 
@@ -268,7 +268,7 @@ def write_summary(reports, results_dir):
             f"{r['cells_passed']}/{r['cells_failed']}/{r['cells_total']} | "
             f"{r['vram_peak_gb']} GB | {r['elapsed_seconds']:.0f}s | {note} |")
     (results_dir / "summary.md").write_text("\n".join(lines) + "\n")
-    print(f"\nSummary: {npass}/{n} passed ({rate:.1f}%)")
+    print(f"\nSummary: {npass}/{n} passed ({rate:.1f}%)", flush=True)
 
 
 def main():
@@ -299,8 +299,20 @@ def main():
             continue
         todo.append((nb_file, row))
 
-    print(f"Running {len(todo)} notebook(s) on GPU 2+3 ...\n")
-    reports = [run_one(nb, row, args, results_dir) for nb, row in todo]
+    total = len(todo)
+    print(f"Running {total} notebook(s) on GPU 2+3 ...\n", flush=True)
+    reports = []
+    for i, (nb_file, row) in enumerate(todo, 1):
+        print(f"==> [{i}/{total}] START {nb_file}  ({row['model_id']})",
+              flush=True)
+        reports.append(run_one(nb_file, row, args, results_dir))
+        npass = sum(r["overall_status"] == "PASSED" for r in reports)
+        nfail = sum(r["overall_status"] == "FAILED" for r in reports)
+        nerr = sum(r["overall_status"] == "ERROR" for r in reports)
+        print(f"    PROGRESS {i}/{total}  ok={npass} fail={nfail} err={nerr}",
+              flush=True)
+        # incremental summary so progress is visible mid-run via artifacts/logs
+        write_summary(reports, results_dir)
     write_summary(reports, results_dir)
 
 

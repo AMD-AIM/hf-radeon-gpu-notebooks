@@ -73,9 +73,10 @@ jobs:
             -v /disk/ssd2:/disk/ssd2 \
             -v "$PWD":/workspace -w /workspace \
             -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+            -e PYTHONUNBUFFERED=1 \
             --entrypoint /bin/bash \
             huaggingface_for_amd_radeon:latest \
-            -lc "python3 tools/run_notebooks.py \
+            -lc "python3 -u tools/run_notebooks.py \
                    --results-dir results \
                    --filter '${{ github.event.inputs.filter }}' $EXTRA"
 
