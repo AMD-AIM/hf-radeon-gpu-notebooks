@@ -224,6 +224,11 @@ def patch_notebook(nb, model_id, local_path, keep_pip):
                 lines.append(ln)
             src = "\n".join(lines)
             src = src.replace(model_id, local_path)          # core path rewrite
+            if "/" in model_id:                              # org-rename alias:
+                _base = re.escape(model_id.split("/")[-1])   # notebooks may pin
+                src = re.sub(                                # the model under a
+                    r"(?<![\w./-])[\w.-]+/" + _base + r"(?![\w./-])",
+                    local_path, src)                         # former org name
             for _url, _local in RESOURCE_MAP.items():        # web asset -> local
                 if _url in src:
                     src = src.replace(_url, _local)
