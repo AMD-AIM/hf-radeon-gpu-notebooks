@@ -9,10 +9,14 @@ nbclient offline, records per-cell PASS/FAIL + peak VRAM + elapsed, and writes
 JSON / HTML / summary.md. The path-rewritten script is NEVER written to disk:
 only the original notebook source plus fresh outputs is persisted.
 
-A live dashboard (results/progress.md + progress.json) is refreshed every few
-seconds so you can watch, in real time: which model is running now (with live
-VRAM + elapsed), which are done (status/VRAM/time), which are pending, and which
-were skipped (with the reason).
+Live observability (for debugging user-reported errors):
+  * results/<model>.log  — per-notebook EXECUTION LOG written cell-by-cell in
+    real time: every cell's stdout/stream output, results, and full error
+    tracebacks. Tail it live, or download it as a CI artifact.
+  * error tracebacks are also echoed to stdout (the GitHub Actions step log) as
+    they happen; pass --echo-output to also echo successful cell output.
+  * results/progress.md + progress.json — live dashboard (running/done/pending/
+    skipped, per-model VRAM + elapsed), refreshed every ~2 s.
 """
 import argparse, copy, csv, json, os, re, subprocess, threading, time
 from datetime import datetime, timezone
@@ -24,6 +28,7 @@ from nbclient import NotebookClient
 REPO = Path(__file__).resolve().parents[1]
 NB_DIR = REPO / "original_notebooks"
 MAP_CSV = REPO / "doc" / "model_path_mapping.csv"
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 # Injected as the first cell of every notebook. Globally forces GPU placement
 # (device_map/torch_dtype default to "auto") and offline mode, so raw HF
@@ -57,8 +62,6 @@ for _n in ("AutoModelForCausalLM", "AutoModelForMultimodalLM",
 print("[ci-normalize] applied")
 '''
 
-# Cells matching this are pure online API / interactive-login demos that cannot
-# run in offline CI; they are commented out wholesale.
 OFFLINE_BAD = re.compile(
     r"router\.huggingface\.co|from openai import|OpenAI\(|YOUR_TOKEN_HERE"
     r"|huggingface_hub import login|login\(\)|from google\.colab")
@@ -132,11 +135,11 @@ class Progress:
     def __init__(self, results_dir, total, skipped, max_gpus):
         self.results_dir = results_dir
         self.total = total
-        self.skipped = skipped            # list of {notebook, model, reason, gpus}
+        self.skipped = skipped
         self.max_gpus = max_gpus
-        self.pending = []                 # list of notebook names
-        self.running = None               # dict or None
-        self.results = []                 # list of finished report dicts
+        self.pending = []
+        self.running = None
+        self.results = []
         self.started_at = time.time()
         self.lock = threading.Lock()
 
@@ -149,10 +152,16 @@ class Progress:
         with self.lock:
             self.running = {"index": idx, "notebook": nb, "model": model,
                             "gpus": gpus, "started_at": time.time(),
-                            "elapsed_s": 0.0, "vram_gb": 0.0,
-                            "vram_peak_gb": 0.0}
+                            "elapsed_s": 0.0, "vram_gb": 0.0, "vram_peak_gb": 0.0,
+                            "cell": 0}
             if nb in self.pending:
                 self.pending.remove(nb)
+        self.flush()
+
+    def set_cell(self, n):
+        with self.lock:
+            if self.running:
+                self.running["cell"] = n
         self.flush()
 
     def update_vram(self, cur_gb, peak_gb):
@@ -172,20 +181,17 @@ class Progress:
 
     def flush(self):
         try:
-            self._write_json()
-            self._write_md()
+            self._write_json(); self._write_md()
         except Exception:
             pass
 
     def _write_json(self):
-        data = {
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-            "elapsed": _fmt_hms(time.time() - self.started_at),
-            "max_gpus": self.max_gpus, "total": self.total,
-            "done": len(self.results), "running": self.running,
-            "pending": self.pending, "skipped": self.skipped,
-            "results": self.results,
-        }
+        data = {"updated_at": datetime.now(timezone.utc).isoformat(),
+                "elapsed": _fmt_hms(time.time() - self.started_at),
+                "max_gpus": self.max_gpus, "total": self.total,
+                "done": len(self.results), "running": self.running,
+                "pending": self.pending, "skipped": self.skipped,
+                "results": self.results}
         tmp = self.results_dir / "progress.json.tmp"
         tmp.write_text(json.dumps(data, indent=2))
         os.replace(tmp, self.results_dir / "progress.json")
@@ -200,27 +206,29 @@ class Progress:
              f"**filter: max_gpus={self.max_gpus}** · "
              f"total {self.total} · done {len(self.results)} "
              f"(ok {npass} / fail {nfail} / err {nerr}) · "
-             f"pending {len(self.pending)} · skipped {len(self.skipped)}", ""]
-        L.append("## ▶ Running now")
+             f"pending {len(self.pending)} · skipped {len(self.skipped)}", "",
+             "## \u25b6 Running now"]
         if self.running:
             r = self.running
             L += ["",
                   f"**[{r['index']}/{self.total}] {r['notebook']}** "
-                  f"(`{r['model']}`, {r['gpus']}-GPU) — running "
-                  f"**{r['elapsed_s']:.0f}s**, VRAM "
-                  f"**{r['vram_gb']} GB** (peak {r['vram_peak_gb']})", ""]
+                  f"(`{r['model']}`, {r['gpus']}-GPU) — cell {r['cell']}, "
+                  f"running **{r['elapsed_s']:.0f}s**, VRAM **{r['vram_gb']} GB** "
+                  f"(peak {r['vram_peak_gb']})  ·  live log: "
+                  f"`results/{r['notebook'].replace('.ipynb', '.log')}`", ""]
         else:
             L += ["", "_idle_", ""]
         L += ["## Done (latest first)", "",
-              "| # | Status | Model | Cells P/F/T | Peak VRAM | Time |",
-              "|--:|:------:|:------|:-----------:|:---------:|-----:|"]
+              "| # | Status | Model | Cells P/F/T | Peak VRAM | Time | Log |",
+              "|--:|:------:|:------|:-----------:|:---------:|-----:|:----|"]
         icon = {"PASSED": "PASS", "FAILED": "FAIL", "ERROR": "ERR "}
         for i, r in enumerate(reversed(self.results), 1):
+            log = r["notebook"].replace(".ipynb", ".log")
             L.append(
                 f"| {len(self.results) - i + 1} | {icon[r['overall_status']]} | "
                 f"`{r['model_id']}` | {r['cells_passed']}/{r['cells_failed']}/"
                 f"{r['cells_total']} | {r['vram_peak_gb']} GB | "
-                f"{r['elapsed_seconds']:.0f}s |")
+                f"{r['elapsed_seconds']:.0f}s | {log} |")
         L += ["", f"## Pending ({len(self.pending)})", ""]
         for nb in self.pending[:40]:
             L.append(f"- {nb}")
@@ -234,7 +242,6 @@ class Progress:
 
 
 def poll_vram(stop, peak, progress):
-    """Track peak summed VRAM (bytes) across the visible GPUs via rocm-smi."""
     while not stop.is_set():
         try:
             out = subprocess.run(
@@ -260,12 +267,49 @@ def poll_vram(stop, peak, progress):
 def run_one(nb_file, row, args, results_dir, progress=None):
     model_id, local_path = row["model_id"], row["local_path"]
     original = json.loads((NB_DIR / nb_file).read_text())
-
-    # --- TEMPORARY, IN-MEMORY ONLY -------------------------------------------
     patched, vl = patch_notebook(copy.deepcopy(original), model_id,
                                  local_path, args.keep_pip)
     nb_node = nbformat.from_dict(patched)
-    # -------------------------------------------------------------------------
+
+    # Per-notebook execution log, written cell-by-cell in real time.
+    log_path = results_dir / nb_file.replace(".ipynb", ".log")
+    logf = open(log_path, "w", buffering=1)
+    logf.write(f"# {nb_file}  ({model_id})  VL={vl}\n"
+               f"# started {datetime.now(timezone.utc).isoformat()}\n"
+               f"# local_path={local_path}\n\n")
+
+    def emit(line, to_stdout=False):
+        logf.write(line + "\n")
+        if to_stdout:
+            print(line, flush=True)
+
+    def on_cell_start(cell, cell_index, **kw):
+        if cell.get("metadata", {}).get("ci_preamble"):
+            return
+        if progress is not None:
+            progress.set_cell(cell_index)
+        src = "".join(cell.get("source", []))
+        emit(f"\n----- cell {cell_index} -----")
+        emit(src.rstrip())
+        emit("----- output -----")
+
+    def on_cell_executed(cell, cell_index, execute_reply=None, **kw):
+        if cell.get("metadata", {}).get("ci_preamble"):
+            return
+        for o in cell.get("outputs", []):
+            t = o.get("output_type")
+            if t == "stream":
+                emit("".join(o.get("text", "")).rstrip(),
+                     to_stdout=args.echo_output)
+            elif t == "execute_result":
+                emit("".join(o.get("data", {}).get("text/plain", "")).rstrip(),
+                     to_stdout=args.echo_output)
+            elif t == "error":
+                # Errors ALWAYS echo to the CI step log (the debugging signal).
+                emit(f"[ERROR] {o.get('ename')}: {o.get('evalue')}",
+                     to_stdout=True)
+                for tb in o.get("traceback", []):
+                    emit(ANSI.sub("", tb).rstrip(), to_stdout=True)
 
     os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     peak, stop = [0], threading.Event()
@@ -275,21 +319,24 @@ def run_one(nb_file, row, args, results_dir, progress=None):
 
     pod_error, exec_err = None, {}
     client = NotebookClient(nb_node, timeout=args.cell_timeout,
-                            allow_errors=True, kernel_name="python3")
+                            allow_errors=True, kernel_name="python3",
+                            on_cell_start=on_cell_start,
+                            on_cell_executed=on_cell_executed)
 
     def _exec():
         try:
             client.execute()
-        except Exception as e:                     # kernel crash / cell timeout
+        except Exception as e:
             exec_err["msg"] = f"{type(e).__name__}: {e}"
 
     start = time.time()
     worker = threading.Thread(target=_exec, daemon=True)
     worker.start()
-    worker.join(args.nb_timeout)                   # whole-notebook watchdog
+    worker.join(args.nb_timeout)
     if worker.is_alive():
         pod_error = f"notebook timeout > {args.nb_timeout}s"
-        try:                                       # force-free the GPU
+        emit(f"[TIMEOUT] {pod_error}", to_stdout=True)
+        try:
             if getattr(client, "km", None) is not None:
                 client.km.shutdown_kernel(now=True)
         except Exception:
@@ -297,10 +344,10 @@ def run_one(nb_file, row, args, results_dir, progress=None):
         worker.join(10)
     elif "msg" in exec_err:
         pod_error = exec_err["msg"]
+        emit(f"[KERNEL-ERROR] {pod_error}", to_stdout=True)
     elapsed = round(time.time() - start, 1)
     stop.set(); th.join(timeout=5)
 
-    # Tally per-cell results, skipping the injected normalization preamble.
     cells, passed, failed = [], 0, 0
     idx = 0
     for cell in nb_node.cells:
@@ -320,8 +367,10 @@ def run_one(nb_file, row, args, results_dir, progress=None):
             cells.append({"index": idx, "status": "PASSED", "error": None})
 
     overall = "ERROR" if pod_error else ("PASSED" if failed == 0 else "FAILED")
+    emit(f"\n# RESULT {overall}  passed={passed} failed={failed} "
+         f"elapsed={elapsed}s peak_vram={round(peak[0] / 1e9, 1)}GB")
+    logf.close()
 
-    # --- Persist the RESULT, not the rewritten script ------------------------
     artifact = nbformat.from_dict(original)
     executed_code = [c for c in nb_node.cells
                      if c.get("cell_type") == "code"
@@ -338,7 +387,6 @@ def run_one(nb_file, row, args, results_dir, progress=None):
     nbformat.write(artifact, str(out_nb))
     subprocess.run(["jupyter", "nbconvert", "--to", "html", str(out_nb)],
                    capture_output=True, text=True)
-    # -------------------------------------------------------------------------
 
     report = {
         "notebook": nb_file, "model_id": model_id, "local_path": local_path,
@@ -347,7 +395,7 @@ def run_one(nb_file, row, args, results_dir, progress=None):
         "cells_passed": passed, "cells_failed": failed,
         "cells_total": passed + failed, "elapsed_seconds": elapsed,
         "vram_peak_gb": round(peak[0] / 1e9, 1), "vram_total_gb": 96.0,
-        "pod_error": pod_error, "cells": cells,
+        "log_file": log_path.name, "pod_error": pod_error, "cells": cells,
         "finished_at": datetime.now(timezone.utc).isoformat(),
     }
     (results_dir / nb_file.replace(".ipynb", ".json")).write_text(
@@ -367,11 +415,9 @@ def write_summary(reports, results_dir):
     rate = (100.0 * npass / n) if n else 0.0
     icon = {"PASSED": "PASS", "FAILED": "FAIL", "ERROR": "ERR "}
     lines = [
-        "# Radeon Local Notebook CI — Results (original_notebooks)",
-        "",
+        "# Radeon Local Notebook CI — Results (original_notebooks)", "",
         f"**{n} notebooks · {npass} passed · {nfail} failed · {nerr} errored "
-        f"· {rate:.1f}% pass** (GPU 2+3, 96 GB budget)",
-        "",
+        f"· {rate:.1f}% pass** (GPU 2+3, 96 GB budget)", "",
         "| # | Status | Model | Notebook | VL | Cells P/F/T | Peak VRAM | Time | Notes |",
         "|--:|:------:|:------|:---------|:--:|:-----------:|:---------:|-----:|:------|",
     ]
@@ -403,8 +449,10 @@ def main():
                     help="only run models needing <= this many GPUs "
                          "(default 1 = single-card only)")
     ap.add_argument("--order", choices=["size", "name"], default="size",
-                    help="run order: 'size' = smallest model first (fast early "
-                         "progress, default); 'name' = filename order")
+                    help="run order: 'size' = smallest model first (default)")
+    ap.add_argument("--echo-output", action="store_true",
+                    help="also echo successful cell output to stdout (errors are "
+                         "always echoed); per-notebook .log always has full output")
     args = ap.parse_args()
 
     results_dir = Path(args.results_dir)
@@ -460,8 +508,8 @@ def main():
 
     reports = []
     for i, (nb_file, row) in enumerate(todo, 1):
-        print(f"==> [{i}/{total}] START {nb_file}  ({row['model_id']})",
-              flush=True)
+        print(f"==> [{i}/{total}] START {nb_file}  ({row['model_id']})  "
+              f"log: results/{nb_file.replace('.ipynb', '.log')}", flush=True)
         progress.start_model(i, nb_file, row["model_id"], row.get("gpus"))
         report = run_one(nb_file, row, args, results_dir, progress)
         progress.finish_model(report)

@@ -103,6 +103,7 @@ jobs:
             results/*.json
             results/*.ipynb
             results/*.html
+            results/*.log
             results/summary.md
             results/progress.md
           retention-days: 30
