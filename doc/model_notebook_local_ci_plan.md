@@ -308,13 +308,43 @@ NB_DIR = REPO / "original_notebooks"
 MAP_CSV = REPO / "doc" / "model_path_mapping.csv"
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
+# Host-local secrets / proxy config (HF_TOKEN, HF_ENDPOINT, ...). Lives OUTSIDE
+# the repo so it is never committed, never uploaded, and survives
+# actions/checkout's clean step. Override with --env-file or RADEON_CI_ENV_FILE.
+DEFAULT_ENV_FILE = os.environ.get(
+    "RADEON_CI_ENV_FILE", "/disk/ssd1/zihaomu_amd/ci_secrets.env")
+SECRET_KEY_HINT = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+
+
+def load_local_env(path):
+    """Parse a KEY=VALUE file (comments / blank lines / optional 'export ')."""
+    env = {}
+    try:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):]
+            k, v = line.split("=", 1)
+            k = k.strip()
+            v = v.strip().strip('"').strip("'")
+            if k:
+                env[k] = v
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[warn] could not read env file {path}: {e}", flush=True)
+    return env
+
+
+def _mask(k, v):
+    return "******" if any(h in k.upper() for h in SECRET_KEY_HINT) else v
+
 # Injected as the first cell of every notebook. Globally forces GPU placement
 # (device_map/torch_dtype default to "auto") and offline mode, so raw HF
 # notebooks that lack device_map="auto" still load on the GPU instead of CPU.
-NORM_PREAMBLE = '''# [ci-normalize] force GPU placement + offline (injected by CI)
-import os as _os
-_os.environ.setdefault("HF_HUB_OFFLINE", "1")
-_os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+NORM_PREAMBLE = '''# [ci-normalize] force GPU placement (injected by CI)
 import functools as _ft, transformers as _tf
 _orig_pipeline = _tf.pipeline
 def _ci_pipeline(*a, **k):
@@ -589,7 +619,6 @@ def run_one(nb_file, row, args, results_dir, progress=None):
                 for tb in o.get("traceback", []):
                     emit(ANSI.sub("", tb).rstrip(), to_stdout=True)
 
-    os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     peak, stop = [0], threading.Event()
     th = threading.Thread(target=poll_vram, args=(stop, peak, progress),
                           daemon=True)
@@ -731,11 +760,37 @@ def main():
     ap.add_argument("--echo-output", action="store_true",
                     help="also echo successful cell output to stdout (errors are "
                          "always echoed); per-notebook .log always has full output")
+    ap.add_argument("--env-file", default="",
+                    help="KEY=VALUE file of extra env (HF_TOKEN, HF_ENDPOINT, "
+                         "proxies) injected before each notebook; host-local, "
+                         "never committed. Defaults to RADEON_CI_ENV_FILE or "
+                         f"{DEFAULT_ENV_FILE}")
     args = ap.parse_args()
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     mapping = load_mapping()
+
+    # Inject host-local env (token / proxy / endpoint) so every kernel inherits
+    # it. The token never enters a notebook cell, an artifact, or git.
+    env_path = args.env_file or DEFAULT_ENV_FILE
+    extra_env = load_local_env(env_path)
+    if extra_env:
+        os.environ.update(extra_env)
+        shown = ", ".join(f"{k}={_mask(k, v)}" for k, v in extra_env.items())
+        print(f"[env] loaded {len(extra_env)} var(s) from {env_path}: {shown}",
+              flush=True)
+        # Network intentionally allowed (proxy/token provided): do NOT force
+        # offline, so notebooks can fetch images etc. Local weights still load
+        # from /disk because ids are rewritten to absolute paths.
+        os.environ.pop("HF_HUB_OFFLINE", None)
+        os.environ.pop("TRANSFORMERS_OFFLINE", None)
+        print("[env] network ENABLED (offline flags cleared)", flush=True)
+    else:
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+        print(f"[env] no env file at {env_path}; running fully OFFLINE",
+              flush=True)
 
     def gpus_of(row):
         try:
