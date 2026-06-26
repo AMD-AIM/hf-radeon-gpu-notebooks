@@ -8,6 +8,11 @@ the local /disk/ssdN path, fix the text-model AutoModel class), executes it with
 nbclient offline, records per-cell PASS/FAIL + peak VRAM + elapsed, and writes
 JSON / HTML / summary.md. The path-rewritten script is NEVER written to disk:
 only the original notebook source plus fresh outputs is persisted.
+
+A live dashboard (results/progress.md + progress.json) is refreshed every few
+seconds so you can watch, in real time: which model is running now (with live
+VRAM + elapsed), which are done (status/VRAM/time), which are pending, and which
+were skipped (with the reason).
 """
 import argparse, copy, csv, json, os, re, subprocess, threading, time
 from datetime import datetime, timezone
@@ -116,7 +121,119 @@ def patch_notebook(nb, model_id, local_path, keep_pip):
     return nb, vl
 
 
-def poll_vram(stop, peak):
+def _fmt_hms(sec):
+    sec = int(sec)
+    return f"{sec // 3600:d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+
+
+class Progress:
+    """Thread-safe live dashboard written to results/progress.{json,md}."""
+
+    def __init__(self, results_dir, total, skipped, max_gpus):
+        self.results_dir = results_dir
+        self.total = total
+        self.skipped = skipped            # list of {notebook, model, reason, gpus}
+        self.max_gpus = max_gpus
+        self.pending = []                 # list of notebook names
+        self.running = None               # dict or None
+        self.results = []                 # list of finished report dicts
+        self.started_at = time.time()
+        self.lock = threading.Lock()
+
+    def set_pending(self, names):
+        with self.lock:
+            self.pending = list(names)
+        self.flush()
+
+    def start_model(self, idx, nb, model, gpus):
+        with self.lock:
+            self.running = {"index": idx, "notebook": nb, "model": model,
+                            "gpus": gpus, "started_at": time.time(),
+                            "elapsed_s": 0.0, "vram_gb": 0.0,
+                            "vram_peak_gb": 0.0}
+            if nb in self.pending:
+                self.pending.remove(nb)
+        self.flush()
+
+    def update_vram(self, cur_gb, peak_gb):
+        with self.lock:
+            if self.running:
+                self.running["vram_gb"] = round(cur_gb, 1)
+                self.running["vram_peak_gb"] = round(peak_gb, 1)
+                self.running["elapsed_s"] = round(
+                    time.time() - self.running["started_at"], 1)
+        self.flush()
+
+    def finish_model(self, report):
+        with self.lock:
+            self.results.append(report)
+            self.running = None
+        self.flush()
+
+    def flush(self):
+        try:
+            self._write_json()
+            self._write_md()
+        except Exception:
+            pass
+
+    def _write_json(self):
+        data = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "elapsed": _fmt_hms(time.time() - self.started_at),
+            "max_gpus": self.max_gpus, "total": self.total,
+            "done": len(self.results), "running": self.running,
+            "pending": self.pending, "skipped": self.skipped,
+            "results": self.results,
+        }
+        tmp = self.results_dir / "progress.json.tmp"
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, self.results_dir / "progress.json")
+
+    def _write_md(self):
+        npass = sum(r["overall_status"] == "PASSED" for r in self.results)
+        nfail = sum(r["overall_status"] == "FAILED" for r in self.results)
+        nerr = sum(r["overall_status"] == "ERROR" for r in self.results)
+        L = ["# Radeon Local Notebook CI — Live Progress", "",
+             f"_updated {datetime.now(timezone.utc).isoformat()} · "
+             f"elapsed {_fmt_hms(time.time() - self.started_at)}_", "",
+             f"**filter: max_gpus={self.max_gpus}** · "
+             f"total {self.total} · done {len(self.results)} "
+             f"(ok {npass} / fail {nfail} / err {nerr}) · "
+             f"pending {len(self.pending)} · skipped {len(self.skipped)}", ""]
+        L.append("## ▶ Running now")
+        if self.running:
+            r = self.running
+            L += ["",
+                  f"**[{r['index']}/{self.total}] {r['notebook']}** "
+                  f"(`{r['model']}`, {r['gpus']}-GPU) — running "
+                  f"**{r['elapsed_s']:.0f}s**, VRAM "
+                  f"**{r['vram_gb']} GB** (peak {r['vram_peak_gb']})", ""]
+        else:
+            L += ["", "_idle_", ""]
+        L += ["## Done (latest first)", "",
+              "| # | Status | Model | Cells P/F/T | Peak VRAM | Time |",
+              "|--:|:------:|:------|:-----------:|:---------:|-----:|"]
+        icon = {"PASSED": "PASS", "FAILED": "FAIL", "ERROR": "ERR "}
+        for i, r in enumerate(reversed(self.results), 1):
+            L.append(
+                f"| {len(self.results) - i + 1} | {icon[r['overall_status']]} | "
+                f"`{r['model_id']}` | {r['cells_passed']}/{r['cells_failed']}/"
+                f"{r['cells_total']} | {r['vram_peak_gb']} GB | "
+                f"{r['elapsed_seconds']:.0f}s |")
+        L += ["", f"## Pending ({len(self.pending)})", ""]
+        for nb in self.pending[:40]:
+            L.append(f"- {nb}")
+        if len(self.pending) > 40:
+            L.append(f"- … and {len(self.pending) - 40} more")
+        L += ["", f"## Skipped ({len(self.skipped)})", "",
+              "| Notebook | Reason | gpus |", "|:---------|:-------|:----:|"]
+        for s in self.skipped:
+            L.append(f"| {s['notebook']} | {s['reason']} | {s.get('gpus', '')} |")
+        (self.results_dir / "progress.md").write_text("\n".join(L) + "\n")
+
+
+def poll_vram(stop, peak, progress):
     """Track peak summed VRAM (bytes) across the visible GPUs via rocm-smi."""
     while not stop.is_set():
         try:
@@ -133,12 +250,14 @@ def poll_vram(stop, peak):
                         except (TypeError, ValueError):
                             pass
             peak[0] = max(peak[0], used)
+            if progress is not None:
+                progress.update_vram(used / 1e9, peak[0] / 1e9)
         except Exception:
             pass
         time.sleep(2)
 
 
-def run_one(nb_file, row, args, results_dir):
+def run_one(nb_file, row, args, results_dir, progress=None):
     model_id, local_path = row["model_id"], row["local_path"]
     original = json.loads((NB_DIR / nb_file).read_text())
 
@@ -150,7 +269,8 @@ def run_one(nb_file, row, args, results_dir):
 
     os.environ.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1")
     peak, stop = [0], threading.Event()
-    th = threading.Thread(target=poll_vram, args=(stop, peak), daemon=True)
+    th = threading.Thread(target=poll_vram, args=(stop, peak, progress),
+                          daemon=True)
     th.start()
 
     pod_error, exec_err = None, {}
@@ -202,8 +322,6 @@ def run_one(nb_file, row, args, results_dir):
     overall = "ERROR" if pod_error else ("PASSED" if failed == 0 else "FAILED")
 
     # --- Persist the RESULT, not the rewritten script ------------------------
-    # Saved notebook = ORIGINAL source (HF ids preserved, no /disk path, no
-    # injected preamble) with only the fresh outputs merged in.
     artifact = nbformat.from_dict(original)
     executed_code = [c for c in nb_node.cells
                      if c.get("cell_type") == "code"
@@ -281,6 +399,9 @@ def main():
     ap.add_argument("--keep-pip", action="store_true")
     ap.add_argument("--include-ineligible", action="store_true",
                     help="also run notebooks marked eligible=no (OOM/incomplete)")
+    ap.add_argument("--max-gpus", type=int, default=1,
+                    help="only run models needing <= this many GPUs "
+                         "(default 1 = single-card only)")
     ap.add_argument("--order", choices=["size", "name"], default="size",
                     help="run order: 'size' = smallest model first (fast early "
                          "progress, default); 'name' = filename order")
@@ -290,7 +411,13 @@ def main():
     results_dir.mkdir(parents=True, exist_ok=True)
     mapping = load_mapping()
 
-    todo = []
+    def gpus_of(row):
+        try:
+            return int(row.get("gpus") or 99)
+        except (TypeError, ValueError):
+            return 99
+
+    todo, skipped = [], []
     for nb_file in sorted(mapping):
         row = mapping[nb_file]
         if args.filter and args.filter.lower() not in (
@@ -298,7 +425,18 @@ def main():
             continue
         if not args.include_ineligible and row.get("eligible") != "yes":
             reason = row.get("download_status") or "ineligible"
-            print(f"[SKIP  ] {nb_file:55} ({reason}, gpus={row.get('gpus')})")
+            skipped.append({"notebook": nb_file, "model": row["model_id"],
+                            "reason": reason, "gpus": row.get("gpus", "")})
+            print(f"[SKIP  ] {nb_file:55} ({reason}, gpus={row.get('gpus')})",
+                  flush=True)
+            continue
+        if gpus_of(row) > args.max_gpus:
+            skipped.append({"notebook": nb_file, "model": row["model_id"],
+                            "reason": f"needs {row.get('gpus')} GPUs "
+                                      f"(> max_gpus={args.max_gpus})",
+                            "gpus": row.get("gpus", "")})
+            print(f"[SKIP  ] {nb_file:55} (needs {row.get('gpus')} GPUs "
+                  f"> max {args.max_gpus})", flush=True)
             continue
         todo.append((nb_file, row))
 
@@ -313,18 +451,26 @@ def main():
         todo.sort(key=_sz)
 
     total = len(todo)
-    print(f"Running {total} notebook(s) on GPU 2+3 ...\n", flush=True)
+    progress = Progress(results_dir, total, skipped, args.max_gpus)
+    progress.set_pending([nb for nb, _ in todo])
+
+    print(f"Running {total} notebook(s) on GPU 2+3 "
+          f"(max_gpus={args.max_gpus}, order={args.order}); "
+          f"{len(skipped)} skipped.\n", flush=True)
+
     reports = []
     for i, (nb_file, row) in enumerate(todo, 1):
         print(f"==> [{i}/{total}] START {nb_file}  ({row['model_id']})",
               flush=True)
-        reports.append(run_one(nb_file, row, args, results_dir))
+        progress.start_model(i, nb_file, row["model_id"], row.get("gpus"))
+        report = run_one(nb_file, row, args, results_dir, progress)
+        progress.finish_model(report)
+        reports.append(report)
         npass = sum(r["overall_status"] == "PASSED" for r in reports)
         nfail = sum(r["overall_status"] == "FAILED" for r in reports)
         nerr = sum(r["overall_status"] == "ERROR" for r in reports)
         print(f"    PROGRESS {i}/{total}  ok={npass} fail={nfail} err={nerr}",
               flush=True)
-        # incremental summary so progress is visible mid-run via artifacts/logs
         write_summary(reports, results_dir)
     write_summary(reports, results_dir)
 

@@ -15,6 +15,10 @@ on:
         description: "Also run >2-GPU / incomplete models (will OOM/fail)"
         type: boolean
         default: false
+      max_gpus:
+        description: "Only run models needing <= this many GPUs (1 = single-card)"
+        required: false
+        default: "1"
   push:
     branches: [ feature/local-ci ]
   schedule:
@@ -61,6 +65,8 @@ jobs:
           EXTRA=""
           if [ "${{ github.event.inputs.keep_pip }}" = "true" ]; then EXTRA="$EXTRA --keep-pip"; fi
           if [ "${{ github.event.inputs.include_ineligible }}" = "true" ]; then EXTRA="$EXTRA --include-ineligible"; fi
+          MAXG="${{ github.event.inputs.max_gpus }}"; [ -z "$MAXG" ] && MAXG=1
+          EXTRA="$EXTRA --max-gpus $MAXG"
           docker run --rm \
             --name "$CI_CONTAINER" \
             --device=/dev/kfd \
@@ -98,4 +104,5 @@ jobs:
             results/*.ipynb
             results/*.html
             results/summary.md
+            results/progress.md
           retention-days: 30
