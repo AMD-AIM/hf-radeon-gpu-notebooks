@@ -307,6 +307,7 @@ REPO = Path(__file__).resolve().parents[1]
 NB_DIR = REPO / "original_notebooks"
 MAP_CSV = REPO / "doc" / "model_path_mapping.csv"
 SOURCE_DATA = REPO / "source_data"        # locally-cached notebook web resources
+SKIP_PASS_CSV = REPO / "doc" / "skip_since_it_pass_list.csv"  # already-passed -> skip
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -442,13 +443,24 @@ ENV_GUARD = re.compile(
     r"""|HF_HUB_OFFLINE|TRANSFORMERS_OFFLINE|HF_HUB_DISABLE_XET|HTTP_PROXY"""
     r"""|HTTPS_PROXY|http_proxy|https_proxy)['"]\s*\]\s*=""")
 VL_KEYS = ("vl", "vision", "image", "multimodal", "omni", "clip", "siglip",
-           "janus", "ocr", "mllama", "idefics", "internvl", "gemma3",
+           "janus", "ocr", "mllama", "idefics", "internvl",
            "minicpm_v", "minicpmo")
 
 
 def load_mapping():
     with open(MAP_CSV, newline="") as f:
         return {r["notebook"]: r for r in csv.DictReader(f)}
+
+
+def load_skip_passed():
+    """Notebook filenames already PASSED in a prior run (doc/skip_since_it_pass_list.csv).
+    Lets a re-run skip known-good notebooks to finish faster. Missing file => no skips."""
+    try:
+        with open(SKIP_PASS_CSV, newline="") as f:
+            return {r["notebook"].strip() for r in csv.DictReader(f)
+                    if r.get("notebook", "").strip()}
+    except FileNotFoundError:
+        return set()
 
 
 def is_vl_model(local_path):
@@ -459,7 +471,10 @@ def is_vl_model(local_path):
         return False
     if "vision_config" in cfg:
         return True
-    blob = (cfg.get("model_type", "") + " " +
+    model_type = cfg.get("model_type", "")
+    if model_type.endswith("_text"):        # e.g. gemma3_text, llama4_text
+        return False                        # text-only sub-config, never VL
+    blob = (model_type + " " +
             " ".join(cfg.get("architectures", []) or [])).lower()
     return any(k in blob for k in VL_KEYS)
 
@@ -651,12 +666,24 @@ def run_one(nb_file, row, args, results_dir, progress=None):
                                  local_path, args.keep_pip)
     nb_node = nbformat.from_dict(patched)
 
+    # GPU visibility for THIS notebook. device_map="auto" spreads a model over
+    # every visible card, so a single-card model would needlessly occupy BOTH
+    # GPUs. Expose exactly as many cards as the model needs (1 for single-card),
+    # leaving the rest free. Render nodes re-index to 0,1 inside the container,
+    # so "0" pins to the first card only.
+    try:
+        need_gpus = max(1, int(row.get("gpus") or 1))
+    except (TypeError, ValueError):
+        need_gpus = 1
+    visible = ",".join(str(i) for i in range(need_gpus))
+
     # Per-notebook execution log, written cell-by-cell in real time.
     log_path = results_dir / nb_file.replace(".ipynb", ".log")
     logf = open(log_path, "w", buffering=1)
     logf.write(f"# {nb_file}  ({model_id})  VL={vl}\n"
                f"# started {datetime.now(timezone.utc).isoformat()}\n"
-               f"# local_path={local_path}\n\n")
+               f"# local_path={local_path}\n"
+               f"# visible_gpus={visible}\n\n")
 
     def emit(line, to_stdout=False):
         logf.write(line + "\n")
@@ -697,6 +724,13 @@ def run_one(nb_file, row, args, results_dir, progress=None):
     th.start()
 
     pod_error, exec_err = None, {}
+    # Pin the kernel subprocess to the right number of GPUs. The kernel inherits
+    # os.environ at launch (inside client.execute), and notebooks run strictly
+    # sequentially, so it is safe to set the vars here and restore them after.
+    _gpu_saved = {v: os.environ.get(v)
+                  for v in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")}
+    os.environ["HIP_VISIBLE_DEVICES"] = visible
+    os.environ["CUDA_VISIBLE_DEVICES"] = visible
     client = NotebookClient(nb_node, timeout=args.cell_timeout,
                             allow_errors=True, kernel_name="python3",
                             on_cell_start=on_cell_start,
@@ -726,6 +760,11 @@ def run_one(nb_file, row, args, results_dir, progress=None):
         emit(f"[KERNEL-ERROR] {pod_error}", to_stdout=True)
     elapsed = round(time.time() - start, 1)
     stop.set(); th.join(timeout=5)
+    for _v, _old in _gpu_saved.items():       # restore host GPU visibility
+        if _old is None:
+            os.environ.pop(_v, None)
+        else:
+            os.environ[_v] = _old
 
     cells, passed, failed = [], 0, 0
     idx = 0
@@ -827,6 +866,9 @@ def main():
     ap.add_argument("--max-gpus", type=int, default=1,
                     help="only run models needing <= this many GPUs "
                          "(default 1 = single-card only)")
+    ap.add_argument("--no-skip-passed", action="store_true",
+                    help="ignore doc/skip_since_it_pass_list.csv and run "
+                         "everything (default: skip already-passed notebooks)")
     ap.add_argument("--order", choices=["size", "name"], default="size",
                     help="run order: 'size' = smallest model first (default)")
     ap.add_argument("--echo-output", action="store_true",
@@ -842,6 +884,7 @@ def main():
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     mapping = load_mapping()
+    skip_passed = set() if args.no_skip_passed else load_skip_passed()
 
     # Inject host-local env (token / proxy / endpoint) so every kernel inherits
     # it. The token never enters a notebook cell, an artifact, or git.
@@ -875,6 +918,13 @@ def main():
         row = mapping[nb_file]
         if args.filter and args.filter.lower() not in (
                 nb_file + " " + row["model_id"]).lower():
+            continue
+        if nb_file in skip_passed:
+            skipped.append({"notebook": nb_file, "model": row["model_id"],
+                            "reason": "already passed (skip list)",
+                            "gpus": row.get("gpus", "")})
+            print(f"[SKIP  ] {nb_file:55} (already passed -- skip list)",
+                  flush=True)
             continue
         if not args.include_ineligible and row.get("eligible") != "yes":
             reason = row.get("download_status") or "ineligible"
