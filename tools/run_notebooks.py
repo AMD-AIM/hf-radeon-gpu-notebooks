@@ -109,42 +109,61 @@ for _n in ("AutoModelForCausalLM", "AutoModelForMultimodalLM",
         return _fp
     _c.from_pretrained = _mk(_orig_fp)
 # ROCm torchvision is built WITHOUT libjpeg, so decode_jpeg/decode_image/
-# read_image raise. VL pipelines call them internally to load images, so we
-# wrap ALL THREE entry points with a PIL fallback (covers every code path that
-# decodes a JPEG inside transformers / qwen_vl_utils / etc.).
+# read_image raise. VL pipelines call them internally to load images. We wrap
+# all three with a PIL fallback. Two subtleties this handles:
+#   (a) transformers.image_utils did `from torchvision.io import decode_image`
+#       at import time (BEFORE this preamble), so patching torchvision.io alone
+#       misses its already-bound reference -> we walk sys.modules and rebind
+#       every module still pointing at the original torchvision function.
+#   (b) decode_image/read_image may receive a FILE PATH str (not just a tensor
+#       or bytes), so the fallback must open paths instead of bytes()-ing a str.
 try:
+    import functools as _ft2, sys as _sys, io as _io, numpy as _np
     import torch as _torch, torchvision.io as _tvio
+    import torchvision.io.image as _tvimg
     from PIL import Image as _PILImage
-    import io as _io, numpy as _np
 
     def _pil_to_chw(_buf):
         _im = _PILImage.open(_io.BytesIO(_buf)).convert("RGB")
         return _torch.from_numpy(_np.array(_im)).permute(2, 0, 1).contiguous()
 
-    def _as_bytes(_inp):
-        return bytes(_inp.cpu().numpy().tobytes()) if hasattr(_inp, "cpu") else bytes(_inp)
+    def _read_any(_inp):                      # path str | bytes | uint8 tensor
+        if isinstance(_inp, str):
+            with open(_inp, "rb") as _fh:
+                return _fh.read()
+        if hasattr(_inp, "cpu"):
+            return bytes(_inp.cpu().numpy().tobytes())
+        return bytes(_inp)
 
     def _wrap_decode(_orig):
+        if getattr(_orig, "_ci_jpeg_wrapped", False):
+            return _orig                      # already wrapped -> no double wrap
+        @_ft2.wraps(_orig)
         def _w(_inp, *_a, **_k):
             try:
                 return _orig(_inp, *_a, **_k)
             except Exception:
-                return _pil_to_chw(_as_bytes(_inp))
+                return _pil_to_chw(_read_any(_inp))
+        _w._ci_jpeg_wrapped = True
         return _w
 
-    for _name in ("decode_jpeg", "decode_image"):
-        if hasattr(_tvio, _name):
-            setattr(_tvio, _name, _wrap_decode(getattr(_tvio, _name)))
-
-    if hasattr(_tvio, "read_image"):
-        _orig_ri = _tvio.read_image
-        def _ci_read_image(_path, *_a, **_k):
-            try:
-                return _orig_ri(_path, *_a, **_k)
-            except Exception:
-                with open(_path, "rb") as _fh:
-                    return _pil_to_chw(_fh.read())
-        _tvio.read_image = _ci_read_image
+    _names = ("decode_jpeg", "decode_image", "read_image")
+    for _mod in (_tvimg, _tvio):              # patch source submodule + re-export
+        for _n in _names:
+            if hasattr(_mod, _n):
+                setattr(_mod, _n, _wrap_decode(getattr(_mod, _n)))
+    for _m in list(_sys.modules.values()):    # patch modules holding the original
+        if _m is None or _m is _tvio or _m is _tvimg:
+            continue
+        for _n in _names:
+            _fn = getattr(_m, _n, None)
+            if (_fn is not None
+                    and getattr(_fn, "__module__", "").startswith("torchvision")
+                    and not getattr(_fn, "_ci_jpeg_wrapped", False)):
+                try:
+                    setattr(_m, _n, _wrap_decode(_fn))
+                except Exception:
+                    pass
 except Exception:
     pass
 print("[ci-normalize] applied")
