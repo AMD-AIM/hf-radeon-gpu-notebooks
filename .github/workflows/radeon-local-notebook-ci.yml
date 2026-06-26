@@ -1,0 +1,70 @@
+name: radeon-local-notebook-ci
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Substring filter on notebook name / model id (blank = all)"
+        required: false
+        default: ""
+      keep_pip:
+        description: "Keep %pip install cells (default: skip)"
+        type: boolean
+        default: false
+  push:
+    branches: [ feature/local-ci ]
+  schedule:
+    - cron: "0 18 * * *"   # nightly 18:00 UTC
+
+concurrency:
+  group: radeon-local-ci          # only one CI on the 2 GPUs at a time
+  cancel-in-progress: false
+
+jobs:
+  run-notebooks:
+    runs-on: [self-hosted, rocm, w7900]   # label your registered runner this way
+    timeout-minutes: 1440
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refresh model path mapping
+        run: python3 tools/build_model_path_mapping.py
+
+      - name: Execute notebooks on GPU 2 + 3
+        run: |
+          mkdir -p results
+          KEEP_PIP=""
+          if [ "${{ github.event.inputs.keep_pip }}" = "true" ]; then KEEP_PIP="--keep-pip"; fi
+          docker run --rm \
+            --name hf-ci-gpu23-${{ github.run_id }} \
+            --device=/dev/kfd \
+            --device=/dev/dri/renderD130 \
+            --device=/dev/dri/renderD131 \
+            --group-add 44 --group-add 993 \
+            --security-opt seccomp=unconfined \
+            --ipc=host --shm-size 32g \
+            -v /disk/ssd1:/disk/ssd1 \
+            -v /disk/ssd2:/disk/ssd2 \
+            -v "$PWD":/workspace -w /workspace \
+            -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+            --entrypoint /bin/bash \
+            huaggingface_for_amd_radeon:latest \
+            -lc "python3 tools/run_notebooks.py \
+                   --results-dir results \
+                   --filter '${{ github.event.inputs.filter }}' $KEEP_PIP"
+
+      - name: Publish summary to job page
+        if: always()
+        run: cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload results (JSON + executed notebooks + HTML)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: radeon-notebook-results-${{ github.run_id }}
+          path: |
+            results/*.json
+            results/*.ipynb
+            results/*.html
+            results/summary.md
+          retention-days: 30
