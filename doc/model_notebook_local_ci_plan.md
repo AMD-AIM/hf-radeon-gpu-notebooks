@@ -385,6 +385,23 @@ for _n in ("AutoModelForCausalLM", "AutoModelForMultimodalLM",
             return orig(cls, *a, **k)
         return _fp
     _c.from_pretrained = _mk(_orig_fp)
+# ROCm torchvision is built WITHOUT libjpeg, so decode_jpeg() raises. VL
+# pipelines call it internally to load images -> fall back to PIL.
+try:
+    import torch as _torch, torchvision.io as _tvio
+    from PIL import Image as _PILImage
+    import io as _io, numpy as _np
+    _orig_dj = _tvio.decode_jpeg
+    def _ci_decode_jpeg(_inp, *_a, **_k):
+        try:
+            return _orig_dj(_inp, *_a, **_k)
+        except Exception:
+            _buf = bytes(_inp.cpu().numpy().tobytes()) if hasattr(_inp, "cpu") else bytes(_inp)
+            _im = _PILImage.open(_io.BytesIO(_buf)).convert("RGB")
+            return _torch.from_numpy(_np.array(_im)).permute(2, 0, 1).contiguous()
+    _tvio.decode_jpeg = _ci_decode_jpeg
+except Exception:
+    pass
 print("[ci-normalize] applied")
 '''
 
