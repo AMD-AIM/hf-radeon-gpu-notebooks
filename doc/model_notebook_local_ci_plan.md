@@ -390,7 +390,8 @@ print("[ci-normalize] applied")
 
 OFFLINE_BAD = re.compile(
     r"router\.huggingface\.co|from openai import|OpenAI\(|YOUR_TOKEN_HERE"
-    r"|huggingface_hub import login|login\(\)|from google\.colab")
+    r"|huggingface_hub import login|login\(\)|from google\.colab"
+    r"|InferenceClient")  # HF cloud remote-inference: needs network/token
 PIP_RE = re.compile(r"^\s*[%!]?\s*pip\s+install", re.I)
 # Defensive: notebooks often reset HF_TOKEN to a placeholder
 # (e.g. os.environ['HF_TOKEN'] = 'YOUR_TOKEN_HERE') or override the endpoint /
