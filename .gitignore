@@ -1,0 +1,6 @@
+ci_secrets.env
+ci_local.env
+*.secrets.env
+*.local.env
+__pycache__/
+*.pyc
