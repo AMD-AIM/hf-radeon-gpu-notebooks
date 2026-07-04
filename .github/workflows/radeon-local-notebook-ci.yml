@@ -7,16 +7,6 @@ on:
         description: "Substring filter on model id / notebook name (blank = all)"
         required: false
         default: ""
-      mode:
-        description: "Notebook source to test"
-        type: choice
-        options: [both, native, fixed]
-        default: both
-      fixed_scope:
-        description: "When mode=both, run Radeon fixed notebooks for all targets or native failures"
-        type: choice
-        options: [all, failed-native]
-        default: all
   push:
     branches: [main, "ci/**"]
 
@@ -42,6 +32,7 @@ jobs:
             .github
             doc
             radeon_notebooks
+            source_data
             tools
           sparse-checkout-cone-mode: true
 
@@ -68,19 +59,11 @@ jobs:
       - name: Execute notebook CI
         env:
           INPUT_FILTER: ${{ github.event.inputs.filter }}
-          INPUT_MODE: ${{ github.event.inputs.mode }}
-          INPUT_FIXED_SCOPE: ${{ github.event.inputs.fixed_scope }}
         run: |
           rm -rf results
           mkdir -p results
 
-          MODE="${INPUT_MODE:-both}"
-          FIXED_SCOPE="${INPUT_FIXED_SCOPE:-all}"
           FILTER="${INPUT_FILTER:-}"
-          FAIL_ON=all
-          if [ "$MODE" = "both" ]; then
-            FAIL_ON=fixed
-          fi
 
           SELECTED_RENDER_NODE="${{ steps.select_gpu.outputs.render_node }}"
           if [ -z "$SELECTED_RENDER_NODE" ]; then
@@ -108,9 +91,6 @@ jobs:
             -e HF_HUB_CACHE="$HF_CACHE_ROOT/hub" \
             -e HF_DATASETS_CACHE="$HF_CACHE_ROOT/datasets" \
             -e TRANSFORMERS_CACHE="$HF_CACHE_ROOT/transformers" \
-            -e CI_MODE="$MODE" \
-            -e CI_FIXED_SCOPE="$FIXED_SCOPE" \
-            -e CI_FAIL_ON="$FAIL_ON" \
             -e CI_FILTER="$FILTER" \
             -e RADEON_CI_RENDER_NODE="$SELECTED_RENDER_NODE" \
             -e RADEON_CI_GPU_CARD="${{ steps.select_gpu.outputs.card_index }}" \
@@ -121,9 +101,8 @@ jobs:
             -lc 'args=(
                   --results-dir results
                   --target-file doc/ci_target_models.csv
-                  --mode "$CI_MODE"
-                  --fixed-scope "$CI_FIXED_SCOPE"
-                  --fail-on "$CI_FAIL_ON"
+                  --mode both
+                  --fail-on fixed
                 )
                 if [ -n "$CI_FILTER" ]; then args+=(--filter "$CI_FILTER"); fi
                 python3 -u tools/run_notebooks.py "${args[@]}"'

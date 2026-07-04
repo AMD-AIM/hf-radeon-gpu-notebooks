@@ -24,6 +24,8 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 TARGET_CSV = REPO / "doc" / "ci_target_models.csv"
 FIXED_NOTEBOOK_DIR = REPO / "radeon_notebooks"
+SOURCE_DATA_DIR = REPO / "source_data"
+SOURCE_MAP_JSON = SOURCE_DATA_DIR / "resource_map.json"
 DEFAULT_ENV_FILE = os.environ.get(
     "RADEON_CI_ENV_FILE", "/disk/ssd1/zihaomu_amd/ci_secrets.env"
 )
@@ -31,10 +33,15 @@ HF_CANONICAL = "https://huggingface.co"
 VRAM_BUDGET_GB = float(os.environ.get("RADEON_CI_VRAM_PER_GPU_GB", "48"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SECRET_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+TOKEN_ENV_KEYS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN")
+LOADED_ENV: dict[str, str] = {}
+SECRET_VALUES: set[str] = set()
 
 
 GPU_PREAMBLE = '''# [ci-normalize] prefer GPU placement for HF helpers.
 import functools as _ci_functools
+import os as _ci_os
+import urllib.request as _ci_urllib_request
 import transformers as _ci_transformers
 
 _ci_original_pipeline = _ci_transformers.pipeline
@@ -66,6 +73,34 @@ for _ci_name in (
         return _ci_from_pretrained
     _ci_cls.from_pretrained = _ci_make_from_pretrained(_ci_original)
 
+_ci_original_urlopen = _ci_urllib_request.urlopen
+def _ci_urlopen(url, *args, **kwargs):
+    candidate = getattr(url, "full_url", url)
+    if isinstance(candidate, str) and _ci_os.path.isfile(candidate):
+        return open(candidate, "rb")
+    return _ci_original_urlopen(url, *args, **kwargs)
+_ci_urllib_request.urlopen = _ci_urlopen
+
+try:
+    import requests as _ci_requests
+    _ci_original_requests_get = _ci_requests.get
+    class _ci_local_file_response:
+        def __init__(self, path):
+            self.path = path
+            self.status_code = 200
+            self.ok = True
+            with open(path, "rb") as _ci_f:
+                self.content = _ci_f.read()
+        def raise_for_status(self):
+            return None
+    def _ci_requests_get(url, *args, **kwargs):
+        if isinstance(url, str) and _ci_os.path.isfile(url):
+            return _ci_local_file_response(url)
+        return _ci_original_requests_get(url, *args, **kwargs)
+    _ci_requests.get = _ci_requests_get
+except Exception:
+    pass
+
 print("[ci-normalize] GPU placement defaults applied")
 '''
 
@@ -73,14 +108,27 @@ PIP_INSTALL_RE = re.compile(
     r"(?is)(?:^|\b|[%!])(?:python3?\s+-m\s+)?pip\s+install\b|['\"]pip\s+install\b"
 )
 REMOTE_ONLY_RE = re.compile(
-    r"router\.huggingface\.co|from openai import|OpenAI\(|YOUR_TOKEN_HERE|"
-    r"huggingface_hub import login|login\(\)|from google\.colab|InferenceClient"
+    r"router\.huggingface\.co|from openai import|OpenAI\(|"
+    r"from google\.colab|InferenceClient"
 )
+REMOTE_INFERENCE_HEADING_RE = re.compile(
+    r"(?im)^\s*##\s+Remote Inference via Inference Providers\b"
+)
+MARKDOWN_SECTION_HEADING_RE = re.compile(r"(?im)^\s*##\s+")
+LOGIN_CALL_RE = re.compile(r"\blogin\s*\(")
 ENV_ASSIGN_RE = re.compile(
     r"""^\s*(?:os\.)?environ\s*\[\s*['"]"""
     r"""(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HUGGINGFACEHUB_API_TOKEN|HF_ENDPOINT|"""
-    r"""HF_HUB_OFFLINE|TRANSFORMERS_OFFLINE|HF_HUB_DISABLE_XET|HTTP_PROXY|"""
+    r"""HF_HUB_DISABLE_XET|HTTP_PROXY|"""
     r"""HTTPS_PROXY|http_proxy|https_proxy)['"]\s*\]\s*="""
+)
+HF_TOKEN_PLACEHOLDER_RE = re.compile(
+    r"""(?m)^(\s*(?:os\.)?environ\s*\[\s*['"]HF_TOKEN['"]\s*\]\s*=\s*)"""
+    r"""['"]YOUR_TOKEN_HERE['"]\s*$"""
+)
+GRANITE_SAMPLE_RE = re.compile(
+    r"""hf_hub_download\(\s*repo_id\s*=\s*model_path\s*,\s*"""
+    r"""filename\s*=\s*['"]multilingual_sample\.wav['"]\s*\)"""
 )
 
 
@@ -94,8 +142,42 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+RUN_STARTED_AT = time.time()
+RUN_STARTED_UTC = utc_now()
+
+
+def load_source_data_rewrites() -> dict[str, str]:
+    if not SOURCE_MAP_JSON.is_file():
+        return {}
+    try:
+        raw_map = json.loads(SOURCE_MAP_JSON.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[source-data] could not load {SOURCE_MAP_JSON}: {exc}", flush=True)
+        return {}
+
+    rewrites: dict[str, str] = {}
+    for url, filename in raw_map.items():
+        local_path = SOURCE_DATA_DIR / str(filename)
+        if local_path.is_file():
+            rewrites[str(url)] = str(local_path.resolve())
+        else:
+            print(f"[source-data] missing local asset for {url}: {local_path}", flush=True)
+    return rewrites
+
+
+SOURCE_DATA_REWRITES = load_source_data_rewrites()
+
+
 def mask_env(name: str, value: str) -> str:
     return "******" if any(h in name.upper() for h in SECRET_HINTS) else value
+
+
+def redact_secrets(text: str) -> str:
+    redacted = str(text)
+    for secret in SECRET_VALUES:
+        if secret and len(secret) >= 8:
+            redacted = redacted.replace(secret, "******")
+    return redacted
 
 
 def load_env_file(path: str) -> None:
@@ -104,8 +186,14 @@ def load_env_file(path: str) -> None:
         print(f"[env] no host env file at {env_path}", flush=True)
         return
 
+    try:
+        env_lines = env_path.read_text().splitlines()
+    except OSError as exc:
+        print(f"[env] could not read {env_path}: {type(exc).__name__}: {exc}", flush=True)
+        return
+
     loaded: dict[str, str] = {}
-    for line in env_path.read_text().splitlines():
+    for line in env_lines:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -115,7 +203,11 @@ def load_env_file(path: str) -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         if key:
-            os.environ[key] = value
+            LOADED_ENV[key] = value
+            if any(h in key.upper() for h in SECRET_HINTS):
+                SECRET_VALUES.add(value)
+            if key not in TOKEN_ENV_KEYS:
+                os.environ[key] = value
             loaded[key] = value
 
     shown = ", ".join(f"{k}={mask_env(k, v)}" for k, v in sorted(loaded.items()))
@@ -243,10 +335,53 @@ def comment_cell(source: str, reason: str) -> str:
 def protect_env_assignments(source: str) -> str:
     lines = []
     for line in source.splitlines():
-        if ENV_ASSIGN_RE.match(line):
+        if (
+            ENV_ASSIGN_RE.match(line)
+            and "[ci-injected-hf-token]" not in line
+        ):
             line = "# [ci-protect env] " + line
         lines.append(line)
     return "\n".join(lines)
+
+
+def runtime_hf_token() -> str:
+    for key in TOKEN_ENV_KEYS:
+        token = LOADED_ENV.get(key) or os.environ.get(key, "")
+        if token and token != "YOUR_TOKEN_HERE":
+            SECRET_VALUES.add(token)
+            return token
+    return ""
+
+
+def inject_fixed_hf_token(source: str, token: str) -> str:
+    if not token:
+        return source
+    return HF_TOKEN_PLACEHOLDER_RE.sub(
+        rf"\1{token!r}  # [ci-injected-hf-token]",
+        source,
+    )
+
+
+def should_skip_remote_or_auth(source: str) -> bool:
+    if REMOTE_ONLY_RE.search(source):
+        return True
+    if HF_TOKEN_PLACEHOLDER_RE.search(source):
+        return True
+    if "huggingface_hub import login" in source or LOGIN_CALL_RE.search(source):
+        return True
+    return False
+
+
+def remote_section_decision(cell: dict[str, Any], in_remote_section: bool) -> tuple[bool, bool]:
+    if cell.get("cell_type") != "markdown":
+        return in_remote_section, in_remote_section
+
+    source = "".join(cell.get("source", []))
+    if REMOTE_INFERENCE_HEADING_RE.search(source):
+        return True, True
+    if in_remote_section and MARKDOWN_SECTION_HEADING_RE.search(source):
+        return False, False
+    return in_remote_section, in_remote_section
 
 
 def rewrite_hf_urls_to_endpoint(source: str) -> str:
@@ -256,10 +391,23 @@ def rewrite_hf_urls_to_endpoint(source: str) -> str:
     return source.replace(HF_CANONICAL, endpoint)
 
 
+def rewrite_source_data_urls(source: str) -> str:
+    for url, local_path in SOURCE_DATA_REWRITES.items():
+        source = source.replace(url, local_path)
+
+    granite_sample = SOURCE_DATA_DIR / "multilingual_sample.wav"
+    if granite_sample.is_file():
+        source = GRANITE_SAMPLE_RE.sub(repr(str(granite_sample.resolve())), source)
+    return source
+
+
 def normalize_notebook(
     notebook: dict[str, Any],
+    mode: str,
 ) -> dict[str, Any]:
     normalized = copy.deepcopy(notebook)
+    fixed_hf_token = runtime_hf_token() if mode == "fixed" else ""
+    in_remote_section = False
     cells: list[dict[str, Any]] = [
         {
             "cell_type": "code",
@@ -270,20 +418,32 @@ def normalize_notebook(
         }
     ]
 
-    for cell in normalized.get("cells", []):
+    for original_index, cell in enumerate(normalized.get("cells", [])):
+        drop_cell, in_remote_section = remote_section_decision(cell, in_remote_section)
+        if drop_cell:
+            continue
+
         if cell.get("cell_type") != "code":
             cells.append(cell)
             continue
 
         source = "".join(cell.get("source", []))
-        if REMOTE_ONLY_RE.search(source):
+        if mode == "fixed":
+            source = inject_fixed_hf_token(source, fixed_hf_token)
+
+        if should_skip_remote_or_auth(source):
             source = comment_cell(source, "remote-or-auth")
         elif PIP_INSTALL_RE.search(source):
             source = comment_cell(source, "pip-cell")
         else:
-            source = rewrite_hf_urls_to_endpoint(protect_env_assignments(source))
+            source = protect_env_assignments(source)
+            source = rewrite_source_data_urls(source)
+            source = rewrite_hf_urls_to_endpoint(source)
 
         clean_cell = dict(cell)
+        metadata = dict(clean_cell.get("metadata") or {})
+        metadata["ci_original_cell_index"] = original_index
+        clean_cell["metadata"] = metadata
         clean_cell["source"] = source
         clean_cell["outputs"] = []
         clean_cell["execution_count"] = None
@@ -395,6 +555,17 @@ def format_pct(value: float | None) -> str:
     return "n/a" if value is None else f"{value:.0f}%"
 
 
+def format_duration(seconds: Any) -> str:
+    value = int(round(float(seconds or 0)))
+    hours, remainder = divmod(value, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
 def core_error(report: dict[str, Any]) -> str:
     if report.get("run_error"):
         return compact_error(report["run_error"])
@@ -462,13 +633,40 @@ def write_summary(
     total = len(reports)
     rate = (100.0 * passed / total) if total else 0.0
     icon = {"PASSED": "PASS", "FAILED": "FAIL", "ERROR": "ERR"}
+    total_elapsed = sum(float(r.get("elapsed_seconds") or 0.0) for r in reports)
+    wall_elapsed = time.time() - RUN_STARTED_AT
+
+    def timing_row(name: str, rows: list[dict[str, Any]]) -> str:
+        elapsed_values = [float(r.get("elapsed_seconds") or 0.0) for r in rows]
+        elapsed_total = sum(elapsed_values)
+        average = elapsed_total / len(elapsed_values) if elapsed_values else 0.0
+        shortest = min(elapsed_values) if elapsed_values else 0.0
+        longest = max(elapsed_values) if elapsed_values else 0.0
+        return (
+            f"| {name} | {len(rows)} | {format_duration(elapsed_total)} | "
+            f"{format_duration(average)} | {format_duration(shortest)} | "
+            f"{format_duration(longest)} |"
+        )
 
     lines = [
         "# Radeon Local Notebook CI - Results",
         "",
-        f"**{total} notebook jobs · {passed} PASS · {failed} FAIL · {errored} ERROR · {rate:.1f}% pass**",
+        f"**{total} notebook jobs · {passed} PASS · {failed} FAIL · {errored} ERROR · "
+        f"{rate:.1f}% pass · CI wall time {format_duration(wall_elapsed)} · "
+        f"notebook time {format_duration(total_elapsed)}**",
+        "",
+        f"Started: {RUN_STARTED_UTC}",
+        f"Generated: {utc_now()}",
         "",
         f"Policy: {policy}",
+        "",
+        "## Timing",
+        "",
+        "| Scope | Jobs | Total Time | Avg / Job | Fastest | Slowest |",
+        "|:------|-----:|-----------:|----------:|--------:|--------:|",
+        timing_row("All", reports),
+        timing_row("HF Native Notebooks", [r for r in reports if r["mode"] == "native"]),
+        timing_row("Radeon Fixed Notebooks", [r for r in reports if r["mode"] == "fixed"]),
     ]
 
     for mode, title in (("native", "HF Native Notebooks"), ("fixed", "Radeon Fixed Notebooks")):
@@ -497,35 +695,7 @@ def write_summary(
                 f"{vram} | "
                 f"{format_pct(report.get('gpu_util_avg_pct'))}/"
                 f"{format_pct(report.get('gpu_util_peak_pct'))} | "
-                f"{report['elapsed_seconds']:.0f}s | {core_error(report)} |"
-            )
-
-    low_gpu = []
-    for report in reports:
-        if report["overall_status"] != "PASSED":
-            continue
-        reasons = []
-        if float(report.get("vram_peak_gb") or 0.0) < 1.0:
-            reasons.append("peak VRAM < 1 GB")
-        if float(report.get("gpu_util_peak_pct") or 0.0) < 10.0:
-            reasons.append("GPU util peak < 10%")
-        if reasons:
-            low_gpu.append((report, "; ".join(reasons)))
-
-    if low_gpu:
-        lines += [
-            "",
-            "## Passed With Low GPU Signal",
-            "",
-            "| Mode | Model | Peak VRAM | GPU util avg/peak | Reason |",
-            "|:----:|:------|:---------:|:-----------------:|:-------|",
-        ]
-        for report, reason in low_gpu:
-            lines.append(
-                f"| {report['mode']} | `{report['model_id']}` | "
-                f"{report['vram_peak_gb']} GB | "
-                f"{format_pct(report.get('gpu_util_avg_pct'))}/"
-                f"{format_pct(report.get('gpu_util_peak_pct'))} | {reason} |"
+                f"{format_duration(report['elapsed_seconds'])} | {core_error(report)} |"
             )
 
     (results_dir / "summary.md").write_text("\n".join(lines) + "\n")
@@ -534,19 +704,42 @@ def write_summary(
 
 def build_artifact_notebook(original: dict[str, Any], executed: dict[str, Any]) -> dict[str, Any]:
     artifact = copy.deepcopy(original)
-    executed_cells = [
-        cell
-        for cell in executed.get("cells", [])
-        if cell.get("cell_type") == "code" and not cell.get("metadata", {}).get("ci_preamble")
-    ]
-    index = 0
-    for cell in artifact.get("cells", []):
-        if cell.get("cell_type") != "code":
+    executed_by_original_index: dict[int, dict[str, Any]] = {}
+    fallback_cells: list[dict[str, Any]] = []
+    for cell in executed.get("cells", []):
+        if cell.get("cell_type") != "code" or cell.get("metadata", {}).get("ci_preamble"):
             continue
-        if index < len(executed_cells):
-            cell["outputs"] = executed_cells[index].get("outputs", [])
-            cell["execution_count"] = executed_cells[index].get("execution_count")
-        index += 1
+        original_index = cell.get("metadata", {}).get("ci_original_cell_index")
+        if isinstance(original_index, int):
+            executed_by_original_index[original_index] = cell
+        else:
+            fallback_cells.append(cell)
+
+    artifact_cells: list[dict[str, Any]] = []
+    in_remote_section = False
+    fallback_index = 0
+    for original_index, cell in enumerate(artifact.get("cells", [])):
+        drop_cell, in_remote_section = remote_section_decision(cell, in_remote_section)
+        if drop_cell:
+            continue
+
+        if cell.get("cell_type") != "code":
+            artifact_cells.append(cell)
+            continue
+
+        executed_cell = executed_by_original_index.get(original_index)
+        if executed_cell is None and fallback_index < len(fallback_cells):
+            executed_cell = fallback_cells[fallback_index]
+            fallback_index += 1
+
+        cell["outputs"] = []
+        cell["execution_count"] = None
+        if executed_cell is not None:
+            cell["outputs"] = executed_cell.get("outputs", [])
+            cell["execution_count"] = executed_cell.get("execution_count")
+        artifact_cells.append(cell)
+
+    artifact["cells"] = artifact_cells
     return artifact
 
 
@@ -563,6 +756,7 @@ def run_one(
     log_path = results_dir / artifact_name.replace(".ipynb", ".log")
 
     def emit(handle: Any, line: str, stdout: bool = False) -> None:
+        line = redact_secrets(line)
         handle.write(line + "\n")
         if stdout:
             print(line, flush=True)
@@ -572,7 +766,7 @@ def run_one(
         source_info: dict[str, str | None] = {"source": None, "fetched_url": None}
         try:
             original, source_info = load_notebook(target, mode)
-            normalized = normalize_notebook(original)
+            normalized = normalize_notebook(original, mode)
             notebook = nbformat.from_dict(normalized)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -799,7 +993,12 @@ def validate_plan(jobs: list[tuple[str, Target]]) -> list[str]:
     for mode, target in jobs:
         try:
             notebook, source = load_notebook(target, mode)
-            code_cells = sum(cell.get("cell_type") == "code" for cell in notebook.get("cells", []))
+            normalized = normalize_notebook(notebook, mode)
+            code_cells = sum(
+                cell.get("cell_type") == "code"
+                and not cell.get("metadata", {}).get("ci_preamble")
+                for cell in normalized.get("cells", [])
+            )
             fetched = source.get("fetched_url") or source.get("source")
             print(
                 f"[PLAN OK] {mode:6} {target.model_id:45} "
@@ -822,12 +1021,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--target-file", default=str(TARGET_CSV))
     parser.add_argument("--mode", choices=["native", "fixed", "both"], default="both")
-    parser.add_argument(
-        "--fixed-scope",
-        choices=["all", "failed-native"],
-        default="all",
-        help="when mode=both, run fixed notebooks for all targets or native failures only",
-    )
     parser.add_argument(
         "--fail-on",
         choices=["all", "fixed", "none"],
@@ -862,9 +1055,7 @@ def main() -> None:
         raise SystemExit(f"no enabled targets matched filter {args.filter!r}")
 
     native_jobs = jobs_for(targets, "native") if args.mode in {"native", "both"} else []
-    fixed_jobs = jobs_for(targets, "fixed") if args.mode == "fixed" else []
-    if args.plan_only and args.mode == "both":
-        fixed_jobs = jobs_for(targets, "fixed")
+    fixed_jobs = jobs_for(targets, "fixed") if args.mode in {"fixed", "both"} else []
 
     if args.plan_only:
         errors = validate_plan(native_jobs + fixed_jobs)
@@ -875,10 +1066,13 @@ def main() -> None:
     elif args.mode == "fixed":
         phases = [("Radeon fixed notebooks", fixed_jobs)]
     else:
-        phases = [("HF native notebooks", native_jobs)]
+        phases = [
+            ("HF native notebooks", native_jobs),
+            ("Radeon fixed notebooks", fixed_jobs),
+        ]
 
     policy = (
-        f"mode={args.mode}; fixed_scope={args.fixed_scope}; fail_on={args.fail_on}; "
+        f"mode={args.mode}; fail_on={args.fail_on}; "
         "single Radeon GPU; model ids load through mounted Hugging Face cache"
     )
     reports: list[dict[str, Any]] = []
@@ -886,8 +1080,8 @@ def main() -> None:
     write_progress(results_dir, reports, pending)
 
     print(
-        f"Running Radeon notebook CI: mode={args.mode}, fixed_scope={args.fixed_scope}, "
-        f"targets={len(targets)}, HF_ENDPOINT={os.environ.get('HF_ENDPOINT', '')}",
+        f"Running Radeon notebook CI: mode={args.mode}, targets={len(targets)}, "
+        f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT', '')}",
         flush=True,
     )
 
@@ -906,19 +1100,6 @@ def main() -> None:
 
     for title, phase_jobs in phases:
         run_phase(title, phase_jobs)
-
-    if args.mode == "both":
-        native_failures = {
-            report["model_id"]
-            for report in reports
-            if report["mode"] == "native" and report["overall_status"] != "PASSED"
-        }
-        if args.fixed_scope == "failed-native":
-            fixed_targets = [target for target in targets if target.model_id in native_failures]
-        else:
-            fixed_targets = targets
-        fixed_jobs = jobs_for(fixed_targets, "fixed")
-        run_phase("Radeon fixed notebooks", fixed_jobs)
 
     write_summary(results_dir, reports, policy)
 
