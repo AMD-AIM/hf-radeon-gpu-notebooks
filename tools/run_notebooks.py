@@ -1,727 +1,944 @@
 #!/usr/bin/env python3
-"""Execute original_notebooks/*.ipynb against local model weights on GPU 2,3.
+"""Run Hugging Face native and Radeon-fixed notebooks for the local W7900 CI."""
 
-Run inside huaggingface_for_amd_radeon:latest. For each eligible notebook the
-runner builds a throwaway IN-MEMORY copy, applies normalization patches (force
-GPU placement, neutralize offline-incompatible demo cells, rewrite the HF id to
-the local /disk/ssdN path, fix the text-model AutoModel class), executes it with
-nbclient offline, records per-cell PASS/FAIL + peak VRAM + elapsed, and writes
-JSON / HTML / summary.md. The path-rewritten script is NEVER written to disk:
-only the original notebook source plus fresh outputs is persisted.
+from __future__ import annotations
 
-Live observability (for debugging user-reported errors):
-  * results/<model>.log  — per-notebook EXECUTION LOG written cell-by-cell in
-    real time: every cell's stdout/stream output, results, and full error
-    tracebacks. Tail it live, or download it as a CI artifact.
-  * error tracebacks are also echoed to stdout (the GitHub Actions step log) as
-    they happen; pass --echo-output to also echo successful cell output.
-  * results/progress.md + progress.json — live dashboard (running/done/pending/
-    skipped, per-model VRAM + elapsed), refreshed every ~2 s.
-"""
-import argparse, copy, csv, json, os, re, subprocess, threading, time
+import argparse
+import copy
+import csv
+import json
+import os
+import re
+import subprocess
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
-import nbformat
-from nbclient import NotebookClient
 
 REPO = Path(__file__).resolve().parents[1]
-NB_DIR = REPO / "original_notebooks"
-MAP_CSV = REPO / "doc" / "model_path_mapping.csv"
-SOURCE_DATA = REPO / "source_data"        # locally-cached notebook web resources
-SKIP_PASS_CSV = REPO / "doc" / "skip_since_it_pass_list.csv"  # already-passed -> skip
-ANSI = re.compile(r"\x1b\[[0-9;]*m")
-
-
-def load_resource_map():
-    """url -> absolute local path, for web images/audio pre-downloaded to
-    source_data/ (so notebooks never fetch them at run time)."""
-    rm = SOURCE_DATA / "resource_map.json"
-    out = {}
-    try:
-        for url, name in json.loads(rm.read_text()).items():
-            if name:
-                out[url] = str(SOURCE_DATA / name)
-    except Exception:
-        pass
-    return out
-
-
-RESOURCE_MAP = load_resource_map()
-
-# Host-local secrets / proxy config (HF_TOKEN, HF_ENDPOINT, ...). Lives OUTSIDE
-# the repo so it is never committed, never uploaded, and survives
-# actions/checkout's clean step. Override with --env-file or RADEON_CI_ENV_FILE.
+TARGET_CSV = REPO / "doc" / "ci_target_models.csv"
+FIXED_NOTEBOOK_DIR = REPO / "radeon_notebooks"
 DEFAULT_ENV_FILE = os.environ.get(
-    "RADEON_CI_ENV_FILE", "/disk/ssd1/zihaomu_amd/ci_secrets.env")
-SECRET_KEY_HINT = ("TOKEN", "KEY", "SECRET", "PASSWORD")
+    "RADEON_CI_ENV_FILE", "/disk/ssd1/zihaomu_amd/ci_secrets.env"
+)
+HF_CANONICAL = "https://huggingface.co"
+VRAM_BUDGET_GB = float(os.environ.get("RADEON_CI_VRAM_PER_GPU_GB", "48"))
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+SECRET_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 
 
-def load_local_env(path):
-    """Parse a KEY=VALUE file (comments / blank lines / optional 'export ')."""
-    env = {}
-    try:
-        for line in Path(path).read_text().splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):]
-            k, v = line.split("=", 1)
-            k = k.strip()
-            v = v.strip().strip('"').strip("'")
-            if k:
-                env[k] = v
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print(f"[warn] could not read env file {path}: {e}", flush=True)
-    return env
+GPU_PREAMBLE = '''# [ci-normalize] prefer GPU placement for HF helpers.
+import functools as _ci_functools
+import transformers as _ci_transformers
 
+_ci_original_pipeline = _ci_transformers.pipeline
+def _ci_pipeline(*args, **kwargs):
+    kwargs.setdefault("device_map", "auto")
+    return _ci_original_pipeline(*args, **kwargs)
+_ci_transformers.pipeline = _ci_pipeline
 
-def _mask(k, v):
-    return "******" if any(h in k.upper() for h in SECRET_KEY_HINT) else v
-
-# Injected as the first cell of every notebook. Globally forces GPU placement
-# (device_map/torch_dtype default to "auto") and offline mode, so raw HF
-# notebooks that lack device_map="auto" still load on the GPU instead of CPU.
-NORM_PREAMBLE = '''# [ci-normalize] force GPU placement (injected by CI)
-import functools as _ft, transformers as _tf
-_orig_pipeline = _tf.pipeline
-def _ci_pipeline(*a, **k):
-    k.setdefault("device_map", "auto")
-    return _orig_pipeline(*a, **k)
-_tf.pipeline = _ci_pipeline
-for _n in ("AutoModelForCausalLM", "AutoModelForMultimodalLM",
-           "AutoModelForImageTextToText", "AutoModelForSeq2SeqLM",
-           "AutoModelForSpeechSeq2Seq", "AutoModel"):
-    _c = getattr(_tf, _n, None)
-    if _c is None:
+for _ci_name in (
+    "AutoModel",
+    "AutoModelForCausalLM",
+    "AutoModelForImageTextToText",
+    "AutoModelForMultimodalLM",
+    "AutoModelForSeq2SeqLM",
+    "AutoModelForSpeechSeq2Seq",
+    "AutoModelForTokenClassification",
+):
+    _ci_cls = getattr(_ci_transformers, _ci_name, None)
+    if _ci_cls is None or not hasattr(_ci_cls, "from_pretrained"):
         continue
-    _orig_fp = _c.from_pretrained.__func__
-    def _mk(orig):
+    _ci_original = _ci_cls.from_pretrained.__func__
+    def _ci_make_from_pretrained(original):
         @classmethod
-        @_ft.wraps(orig)
-        def _fp(cls, *a, **k):
-            k.setdefault("device_map", "auto")
-            k.setdefault("torch_dtype", "auto")
-            return orig(cls, *a, **k)
-        return _fp
-    _c.from_pretrained = _mk(_orig_fp)
-# ROCm torchvision is built WITHOUT libjpeg, so decode_jpeg/decode_image/
-# read_image raise. VL pipelines call them internally to load images. We wrap
-# all three with a PIL fallback. Two subtleties this handles:
-#   (a) transformers.image_utils did `from torchvision.io import decode_image`
-#       at import time (BEFORE this preamble), so patching torchvision.io alone
-#       misses its already-bound reference -> we walk sys.modules and rebind
-#       every module still pointing at the original torchvision function.
-#   (b) decode_image/read_image may receive a FILE PATH str (not just a tensor
-#       or bytes), so the fallback must open paths instead of bytes()-ing a str.
-try:
-    import functools as _ft2, sys as _sys, io as _io, numpy as _np
-    import torch as _torch, torchvision.io as _tvio
-    import torchvision.io.image as _tvimg
-    from PIL import Image as _PILImage
+        @_ci_functools.wraps(original)
+        def _ci_from_pretrained(cls, *args, **kwargs):
+            kwargs.setdefault("device_map", "auto")
+            kwargs.setdefault("torch_dtype", "auto")
+            return original(cls, *args, **kwargs)
+        return _ci_from_pretrained
+    _ci_cls.from_pretrained = _ci_make_from_pretrained(_ci_original)
 
-    def _pil_to_chw(_buf):
-        _im = _PILImage.open(_io.BytesIO(_buf)).convert("RGB")
-        return _torch.from_numpy(_np.array(_im)).permute(2, 0, 1).contiguous()
-
-    def _read_any(_inp):                      # path str | bytes | uint8 tensor
-        if isinstance(_inp, str):
-            with open(_inp, "rb") as _fh:
-                return _fh.read()
-        if hasattr(_inp, "cpu"):
-            return bytes(_inp.cpu().numpy().tobytes())
-        return bytes(_inp)
-
-    def _wrap_decode(_orig):
-        if getattr(_orig, "_ci_jpeg_wrapped", False):
-            return _orig                      # already wrapped -> no double wrap
-        @_ft2.wraps(_orig)
-        def _w(_inp, *_a, **_k):
-            try:
-                return _orig(_inp, *_a, **_k)
-            except Exception:
-                return _pil_to_chw(_read_any(_inp))
-        _w._ci_jpeg_wrapped = True
-        return _w
-
-    _names = ("decode_jpeg", "decode_image", "read_image")
-    for _mod in (_tvimg, _tvio):              # patch source submodule + re-export
-        for _n in _names:
-            if hasattr(_mod, _n):
-                setattr(_mod, _n, _wrap_decode(getattr(_mod, _n)))
-    for _m in list(_sys.modules.values()):    # patch modules holding the original
-        if _m is None or _m is _tvio or _m is _tvimg:
-            continue
-        for _n in _names:
-            _fn = getattr(_m, _n, None)
-            if (_fn is not None
-                    and getattr(_fn, "__module__", "").startswith("torchvision")
-                    and not getattr(_fn, "_ci_jpeg_wrapped", False)):
-                try:
-                    setattr(_m, _n, _wrap_decode(_fn))
-                except Exception:
-                    pass
-except Exception:
-    pass
-print("[ci-normalize] applied")
+print("[ci-normalize] GPU placement defaults applied")
 '''
 
-OFFLINE_BAD = re.compile(
-    r"router\.huggingface\.co|from openai import|OpenAI\(|YOUR_TOKEN_HERE"
-    r"|huggingface_hub import login|login\(\)|from google\.colab"
-    r"|InferenceClient")  # HF cloud remote-inference: needs network/token
-PIP_RE = re.compile(r"^\s*[%!]?\s*pip\s+install", re.I)
-# Defensive: notebooks often reset HF_TOKEN to a placeholder
-# (e.g. os.environ['HF_TOKEN'] = 'YOUR_TOKEN_HERE') or override the endpoint /
-# offline flags. Such a line would clobber the host-local env we injected. We
-# comment out ONLY those lines so the rest of the cell still runs.
-ENV_GUARD = re.compile(
+PIP_INSTALL_RE = re.compile(
+    r"(?is)(?:^|\b|[%!])(?:python3?\s+-m\s+)?pip\s+install\b|['\"]pip\s+install\b"
+)
+REMOTE_ONLY_RE = re.compile(
+    r"router\.huggingface\.co|from openai import|OpenAI\(|YOUR_TOKEN_HERE|"
+    r"huggingface_hub import login|login\(\)|from google\.colab|InferenceClient"
+)
+ENV_ASSIGN_RE = re.compile(
     r"""^\s*(?:os\.)?environ\s*\[\s*['"]"""
-    r"""(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HUGGINGFACEHUB_API_TOKEN|HF_ENDPOINT"""
-    r"""|HF_HUB_OFFLINE|TRANSFORMERS_OFFLINE|HF_HUB_DISABLE_XET|HTTP_PROXY"""
-    r"""|HTTPS_PROXY|http_proxy|https_proxy)['"]\s*\]\s*=""")
-VL_KEYS = ("vl", "vision", "image", "multimodal", "omni", "clip", "siglip",
-           "janus", "ocr", "mllama", "idefics", "internvl",
-           "minicpm_v", "minicpmo")
+    r"""(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HUGGINGFACEHUB_API_TOKEN|HF_ENDPOINT|"""
+    r"""HF_HUB_OFFLINE|TRANSFORMERS_OFFLINE|HF_HUB_DISABLE_XET|HTTP_PROXY|"""
+    r"""HTTPS_PROXY|http_proxy|https_proxy)['"]\s*\]\s*="""
+)
 
 
-def load_mapping():
-    with open(MAP_CSV, newline="") as f:
-        return {r["notebook"]: r for r in csv.DictReader(f)}
+@dataclass(frozen=True)
+class Target:
+    model_id: str
+    notebook: str
 
 
-def load_skip_passed():
-    """Notebook filenames already PASSED in a prior run (doc/skip_since_it_pass_list.csv).
-    Lets a re-run skip known-good notebooks to finish faster. Missing file => no skips."""
-    try:
-        with open(SKIP_PASS_CSV, newline="") as f:
-            return {r["notebook"].strip() for r in csv.DictReader(f)
-                    if r.get("notebook", "").strip()}
-    except FileNotFoundError:
-        return set()
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def is_vl_model(local_path):
-    """Decide whether a model is vision/multimodal from its local config.json."""
-    try:
-        cfg = json.load(open(os.path.join(local_path, "config.json")))
-    except Exception:
-        return False
-    if "vision_config" in cfg:
-        return True
-    model_type = cfg.get("model_type", "")
-    if model_type.endswith("_text"):        # e.g. gemma3_text, llama4_text
-        return False                        # text-only sub-config, never VL
-    blob = (model_type + " " +
-            " ".join(cfg.get("architectures", []) or [])).lower()
-    return any(k in blob for k in VL_KEYS)
+def mask_env(name: str, value: str) -> str:
+    return "******" if any(h in name.upper() for h in SECRET_HINTS) else value
 
 
-def patch_notebook(nb, model_id, local_path, keep_pip):
-    vl = is_vl_model(local_path)
-    preamble = {"cell_type": "code", "metadata": {"ci_preamble": True},
-                "execution_count": None, "outputs": [], "source": NORM_PREAMBLE}
-    out_cells = [preamble]
-    for cell in nb.get("cells", []):
-        if cell.get("cell_type") != "code":
-            out_cells.append(cell)
+def load_env_file(path: str) -> None:
+    env_path = Path(path)
+    if not env_path.is_file():
+        print(f"[env] no host env file at {env_path}", flush=True)
+        return
+
+    loaded: dict[str, str] = {}
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
             continue
-        src = "".join(cell.get("source", []))
-        if OFFLINE_BAD.search(src):
-            src = "\n".join("# [ci-skip offline] " + ln
-                            for ln in src.splitlines())
+        if line.startswith("export "):
+            line = line[len("export ") :]
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key:
+            os.environ[key] = value
+            loaded[key] = value
+
+    shown = ", ".join(f"{k}={mask_env(k, v)}" for k, v in sorted(loaded.items()))
+    print(f"[env] loaded {len(loaded)} var(s) from {env_path}: {shown}", flush=True)
+
+
+def load_targets(path: Path, text_filter: str = "") -> list[Target]:
+    targets: list[Target] = []
+    needle = text_filter.lower().strip()
+    with path.open(newline="") as f:
+        for index, row in enumerate(csv.DictReader(f), 2):
+            enabled = (row.get("enabled") or "yes").strip().lower()
+            if enabled in {"0", "false", "no", "n"}:
+                continue
+
+            model_id = (row.get("model_id") or "").strip()
+            notebook = (row.get("notebook") or "").strip()
+            if not model_id or not notebook:
+                raise ValueError(f"{path}:{index}: model_id and notebook are required")
+            if needle and needle not in f"{model_id} {notebook}".lower():
+                continue
+            targets.append(Target(model_id=model_id, notebook=notebook))
+
+    return targets
+
+
+def hf_endpoint_url(path: str) -> str | None:
+    endpoint = os.environ.get("HF_ENDPOINT", "").strip().rstrip("/")
+    if not endpoint:
+        return None
+    return f"{endpoint}/{path.lstrip('/')}"
+
+
+def native_notebook_urls(model_id: str) -> list[str]:
+    canonical = f"{HF_CANONICAL}/{model_id}.ipynb"
+    urls = []
+    endpoint = hf_endpoint_url(f"{model_id}.ipynb")
+    if endpoint:
+        urls.append(endpoint)
+    urls.append(canonical)
+    return list(dict.fromkeys(urls))
+
+
+def read_json_url(url: str, timeout: int = 120) -> Any:
+    headers = {"User-Agent": "radeon-local-notebook-ci"}
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def load_notebook(target: Target, mode: str) -> tuple[dict[str, Any], dict[str, str | None]]:
+    if mode == "native":
+        errors: list[str] = []
+        for url in native_notebook_urls(target.model_id):
+            for attempt in range(1, 4):
+                try:
+                    return read_json_url(url), {
+                        "source": f"{HF_CANONICAL}/{target.model_id}.ipynb",
+                        "fetched_url": url,
+                    }
+                except (
+                    OSError,
+                    TimeoutError,
+                    urllib.error.URLError,
+                    json.JSONDecodeError,
+                    UnicodeDecodeError,
+                ) as exc:
+                    errors.append(f"{url} attempt {attempt}: {type(exc).__name__}: {exc}")
+                    time.sleep(min(attempt * 2, 5))
+        raise RuntimeError("could not download native notebook: " + " | ".join(errors))
+
+    path = FIXED_NOTEBOOK_DIR / target.notebook
+    if not path.is_file():
+        raise FileNotFoundError(f"fixed notebook not found: {path}")
+    return json.loads(path.read_text()), {
+        "source": str(path.relative_to(REPO)),
+        "fetched_url": None,
+    }
+
+
+def assert_jpeg_support() -> None:
+    try:
+        import torch
+        import torchvision
+        import torchvision.io as tvio
+        from PIL import Image
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            f"required CI dependency is missing ({exc.name}); run inside "
+            "huaggingface_for_amd_radeon:latest"
+        ) from exc
+
+    try:
+        jpg = Path(tempfile.gettempdir()) / "radeon_ci_jpeg_smoke.jpg"
+        Image.new("RGB", (8, 8), color=(32, 96, 160)).save(jpg, format="JPEG")
+        encoded = tvio.read_file(str(jpg))
+        checks = {
+            "decode_image": tvio.decode_image(encoded),
+            "decode_jpeg": tvio.decode_jpeg(encoded),
+            "read_image": tvio.read_image(str(jpg)),
+        }
+        for name, tensor in checks.items():
+            if tuple(getattr(tensor, "shape", ())) != (3, 8, 8):
+                raise RuntimeError(f"{name} returned unexpected shape {tuple(tensor.shape)}")
+    except Exception as exc:
+        raise RuntimeError(
+            "native torchvision JPEG decode failed; this CI no longer injects "
+            "a PIL fallback, so the image must provide libjpeg support"
+        ) from exc
+
+    print(
+        "[preflight] native torchvision JPEG decode OK "
+        f"(torch={torch.__version__}, torchvision={torchvision.__version__})",
+        flush=True,
+    )
+
+
+def comment_cell(source: str, reason: str) -> str:
+    return "\n".join(f"# [ci-skip {reason}] {line}" for line in source.splitlines())
+
+
+def protect_env_assignments(source: str) -> str:
+    lines = []
+    for line in source.splitlines():
+        if ENV_ASSIGN_RE.match(line):
+            line = "# [ci-protect env] " + line
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def rewrite_hf_urls_to_endpoint(source: str) -> str:
+    endpoint = os.environ.get("HF_ENDPOINT", "").strip().rstrip("/")
+    if not endpoint:
+        return source
+    return source.replace(HF_CANONICAL, endpoint)
+
+
+def normalize_notebook(
+    notebook: dict[str, Any],
+) -> dict[str, Any]:
+    normalized = copy.deepcopy(notebook)
+    cells: list[dict[str, Any]] = [
+        {
+            "cell_type": "code",
+            "metadata": {"ci_preamble": True},
+            "execution_count": None,
+            "outputs": [],
+            "source": GPU_PREAMBLE,
+        }
+    ]
+
+    for cell in normalized.get("cells", []):
+        if cell.get("cell_type") != "code":
+            cells.append(cell)
+            continue
+
+        source = "".join(cell.get("source", []))
+        if REMOTE_ONLY_RE.search(source):
+            source = comment_cell(source, "remote-or-auth")
+        elif PIP_INSTALL_RE.search(source):
+            source = comment_cell(source, "pip-cell")
         else:
-            lines = []
-            for ln in src.splitlines():
-                if not keep_pip and PIP_RE.match(ln):
-                    ln = "# [ci-skip pip] " + ln
-                elif ENV_GUARD.match(ln):
-                    ln = "# [ci-protect env] " + ln
-                lines.append(ln)
-            src = "\n".join(lines)
-            src = src.replace(model_id, local_path)          # core path rewrite
-            if "/" in model_id:                              # org-rename alias:
-                _base = re.escape(model_id.split("/")[-1])   # notebooks may pin
-                src = re.sub(                                # the model under a
-                    r"(?<![\w./-])[\w.-]+/" + _base + r"(?![\w./-])",
-                    local_path, src)                         # former org name
-            for _url, _local in RESOURCE_MAP.items():        # web asset -> local
-                if _url in src:
-                    src = src.replace(_url, _local)
-            if not vl:                                       # text model fix
-                src = src.replace("AutoModelForMultimodalLM",
-                                  "AutoModelForCausalLM")
-        cell = dict(cell)
-        cell["source"] = src
-        cell["outputs"] = []
-        cell["execution_count"] = None
-        out_cells.append(cell)
-    nb = dict(nb)
-    nb["cells"] = out_cells
-    nb.get("metadata", {}).pop("kernelspec", None)
-    return nb, vl
+            source = rewrite_hf_urls_to_endpoint(protect_env_assignments(source))
+
+        clean_cell = dict(cell)
+        clean_cell["source"] = source
+        clean_cell["outputs"] = []
+        clean_cell["execution_count"] = None
+        cells.append(clean_cell)
+
+    normalized["cells"] = cells
+    normalized.get("metadata", {}).pop("kernelspec", None)
+    return normalized
 
 
-def _fmt_hms(sec):
-    sec = int(sec)
-    return f"{sec // 3600:d}:{(sec % 3600) // 60:02d}:{sec % 60:02d}"
+def strip_ansi(text: str) -> str:
+    return ANSI_RE.sub("", text)
 
 
-class Progress:
-    """Thread-safe live dashboard written to results/progress.{json,md}."""
-
-    def __init__(self, results_dir, total, skipped, max_gpus):
-        self.results_dir = results_dir
-        self.total = total
-        self.skipped = skipped
-        self.max_gpus = max_gpus
-        self.pending = []
-        self.running = None
-        self.results = []
-        self.started_at = time.time()
-        self.lock = threading.Lock()
-
-    def set_pending(self, names):
-        with self.lock:
-            self.pending = list(names)
-        self.flush()
-
-    def start_model(self, idx, nb, model, gpus):
-        with self.lock:
-            self.running = {"index": idx, "notebook": nb, "model": model,
-                            "gpus": gpus, "started_at": time.time(),
-                            "elapsed_s": 0.0, "vram_gb": 0.0, "vram_peak_gb": 0.0,
-                            "cell": 0}
-            if nb in self.pending:
-                self.pending.remove(nb)
-        self.flush()
-
-    def set_cell(self, n):
-        with self.lock:
-            if self.running:
-                self.running["cell"] = n
-        self.flush()
-
-    def update_vram(self, cur_gb, peak_gb):
-        with self.lock:
-            if self.running:
-                self.running["vram_gb"] = round(cur_gb, 1)
-                self.running["vram_peak_gb"] = round(peak_gb, 1)
-                self.running["elapsed_s"] = round(
-                    time.time() - self.running["started_at"], 1)
-        self.flush()
-
-    def finish_model(self, report):
-        with self.lock:
-            self.results.append(report)
-            self.running = None
-        self.flush()
-
-    def flush(self):
-        try:
-            self._write_json(); self._write_md()
-        except Exception:
-            pass
-
-    def _write_json(self):
-        data = {"updated_at": datetime.now(timezone.utc).isoformat(),
-                "elapsed": _fmt_hms(time.time() - self.started_at),
-                "max_gpus": self.max_gpus, "total": self.total,
-                "done": len(self.results), "running": self.running,
-                "pending": self.pending, "skipped": self.skipped,
-                "results": self.results}
-        tmp = self.results_dir / "progress.json.tmp"
-        tmp.write_text(json.dumps(data, indent=2))
-        os.replace(tmp, self.results_dir / "progress.json")
-
-    def _write_md(self):
-        npass = sum(r["overall_status"] == "PASSED" for r in self.results)
-        nfail = sum(r["overall_status"] == "FAILED" for r in self.results)
-        nerr = sum(r["overall_status"] == "ERROR" for r in self.results)
-        L = ["# Radeon Local Notebook CI — Live Progress", "",
-             f"_updated {datetime.now(timezone.utc).isoformat()} · "
-             f"elapsed {_fmt_hms(time.time() - self.started_at)}_", "",
-             f"**filter: max_gpus={self.max_gpus}** · "
-             f"total {self.total} · done {len(self.results)} "
-             f"(ok {npass} / fail {nfail} / err {nerr}) · "
-             f"pending {len(self.pending)} · skipped {len(self.skipped)}", "",
-             "## \u25b6 Running now"]
-        if self.running:
-            r = self.running
-            L += ["",
-                  f"**[{r['index']}/{self.total}] {r['notebook']}** "
-                  f"(`{r['model']}`, {r['gpus']}-GPU) — cell {r['cell']}, "
-                  f"running **{r['elapsed_s']:.0f}s**, VRAM **{r['vram_gb']} GB** "
-                  f"(peak {r['vram_peak_gb']})  ·  live log: "
-                  f"`results/{r['notebook'].replace('.ipynb', '.log')}`", ""]
-        else:
-            L += ["", "_idle_", ""]
-        L += ["## Done (latest first)", "",
-              "| # | Status | Model | Cells P/F/T | Peak VRAM | Time | Log |",
-              "|--:|:------:|:------|:-----------:|:---------:|-----:|:----|"]
-        icon = {"PASSED": "PASS", "FAILED": "FAIL", "ERROR": "ERR "}
-        for i, r in enumerate(reversed(self.results), 1):
-            log = r["notebook"].replace(".ipynb", ".log")
-            L.append(
-                f"| {len(self.results) - i + 1} | {icon[r['overall_status']]} | "
-                f"`{r['model_id']}` | {r['cells_passed']}/{r['cells_failed']}/"
-                f"{r['cells_total']} | {r['vram_peak_gb']} GB | "
-                f"{r['elapsed_seconds']:.0f}s | {log} |")
-        L += ["", f"## Pending ({len(self.pending)})", ""]
-        for nb in self.pending[:40]:
-            L.append(f"- {nb}")
-        if len(self.pending) > 40:
-            L.append(f"- … and {len(self.pending) - 40} more")
-        L += ["", f"## Skipped ({len(self.skipped)})", "",
-              "| Notebook | Reason | gpus |", "|:---------|:-------|:----:|"]
-        for s in self.skipped:
-            L.append(f"| {s['notebook']} | {s['reason']} | {s.get('gpus', '')} |")
-        (self.results_dir / "progress.md").write_text("\n".join(L) + "\n")
+def compact_error(text: str | None, limit: int = 180) -> str:
+    if not text:
+        return ""
+    text = " ".join(strip_ansi(str(text)).replace("\n", " ").replace("\r", " ").split())
+    for marker in (
+        " See documentation",
+        " If reserved",
+        " You can update",
+        " If this does not work",
+        " This could be because",
+    ):
+        pos = text.find(marker)
+        if pos != -1:
+            text = text[:pos].rstrip()
+    text = text.replace("|", "\\|")
+    if len(text) > limit:
+        return text[: limit - 1].rstrip() + "…"
+    return text
 
 
-def poll_vram(stop, peak, progress):
+def metric_number(value: Any) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", str(value or "").replace(",", ""))
+    return float(match.group(0)) if match else None
+
+
+def metric_bytes(value: Any) -> int | None:
+    number = metric_number(value)
+    if number is None:
+        return None
+    text = str(value or "").lower()
+    if "tib" in text:
+        return int(number * 1024**4)
+    if "tb" in text:
+        return int(number * 1000**4)
+    if "gib" in text:
+        return int(number * 1024**3)
+    if "gb" in text:
+        return int(number * 1000**3)
+    if "mib" in text:
+        return int(number * 1024**2)
+    if "mb" in text:
+        return int(number * 1000**2)
+    return int(number)
+
+
+def sample_gpu() -> tuple[int, float | None]:
+    result = subprocess.run(
+        ["rocm-smi", "--showmeminfo", "vram", "--showuse", "--json"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    data = json.loads(result.stdout)
+    used_bytes = 0
+    util_values: list[float] = []
+    for card in data.values():
+        if not isinstance(card, dict):
+            continue
+        for key, value in card.items():
+            lowered = key.lower()
+            if "used" in lowered and "vram" in lowered:
+                parsed = metric_bytes(value)
+                if parsed is not None:
+                    used_bytes += parsed
+            if (
+                "gpu" in lowered
+                and ("use" in lowered or "util" in lowered or "busy" in lowered)
+                and "memory" not in lowered
+                and "vram" not in lowered
+            ):
+                util = metric_number(value)
+                if util is not None:
+                    util_values.append(max(0.0, min(100.0, util)))
+    return used_bytes, (max(util_values) if util_values else None)
+
+
+def poll_gpu(stop: threading.Event, stats: dict[str, Any]) -> None:
     while not stop.is_set():
         try:
-            out = subprocess.run(
-                ["rocm-smi", "--showmeminfo", "vram", "--json"],
-                capture_output=True, text=True, timeout=10).stdout
-            data = json.loads(out)
-            used = 0
-            for card in data.values():
-                for k, v in card.items():
-                    if "used" in k.lower() and "vram" in k.lower():
-                        try:
-                            used += int(v)
-                        except (TypeError, ValueError):
-                            pass
-            peak[0] = max(peak[0], used)
-            if progress is not None:
-                progress.update_vram(used / 1e9, peak[0] / 1e9)
+            used, util = sample_gpu()
+            stats["vram_peak_bytes"] = max(stats["vram_peak_bytes"], used)
+            if util is not None:
+                stats["gpu_util_peak_pct"] = max(stats["gpu_util_peak_pct"], util)
+                stats["gpu_util_sum_pct"] += util
+                stats["gpu_util_samples"] += 1
         except Exception:
             pass
         time.sleep(2)
 
 
-def run_one(nb_file, row, args, results_dir, progress=None):
-    model_id, local_path = row["model_id"], row["local_path"]
-    original = json.loads((NB_DIR / nb_file).read_text())
-    patched, vl = patch_notebook(copy.deepcopy(original), model_id,
-                                 local_path, args.keep_pip)
-    nb_node = nbformat.from_dict(patched)
+def format_pct(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.0f}%"
 
-    # GPU visibility for THIS notebook. device_map="auto" spreads a model over
-    # every visible card, so a single-card model would needlessly occupy BOTH
-    # GPUs. Expose exactly as many cards as the model needs (1 for single-card),
-    # leaving the rest free. Render nodes re-index to 0,1 inside the container,
-    # so "0" pins to the first card only.
-    try:
-        need_gpus = max(1, int(row.get("gpus") or 1))
-    except (TypeError, ValueError):
-        need_gpus = 1
-    visible = ",".join(str(i) for i in range(need_gpus))
 
-    # Per-notebook execution log, written cell-by-cell in real time.
-    log_path = results_dir / nb_file.replace(".ipynb", ".log")
-    logf = open(log_path, "w", buffering=1)
-    logf.write(f"# {nb_file}  ({model_id})  VL={vl}\n"
-               f"# started {datetime.now(timezone.utc).isoformat()}\n"
-               f"# local_path={local_path}\n"
-               f"# visible_gpus={visible}\n\n")
+def core_error(report: dict[str, Any]) -> str:
+    if report.get("run_error"):
+        return compact_error(report["run_error"])
+    for cell in report.get("cells", []):
+        if cell.get("status") != "PASSED" and cell.get("error"):
+            return compact_error(cell["error"])
+    return ""
 
-    def emit(line, to_stdout=False):
-        logf.write(line + "\n")
-        if to_stdout:
+
+def save_json(path: Path, data: Any) -> None:
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+
+
+def write_progress(
+    results_dir: Path,
+    reports: list[dict[str, Any]],
+    pending: list[str],
+    running: str | None = None,
+) -> None:
+    passed = sum(r["overall_status"] == "PASSED" for r in reports)
+    failed = sum(r["overall_status"] == "FAILED" for r in reports)
+    errored = sum(r["overall_status"] == "ERROR" for r in reports)
+    lines = [
+        "# Radeon Notebook CI Progress",
+        "",
+        f"_updated {utc_now()}_",
+        "",
+        f"done {len(reports)} · PASS {passed} · FAIL {failed} · ERROR {errored} · pending {len(pending)}",
+        "",
+    ]
+    if running:
+        lines += [f"Running: `{running}`", ""]
+
+    if reports:
+        lines += [
+            "| # | Mode | Status | Model | Peak VRAM | GPU util avg/peak | Time | Log |",
+            "|--:|:----:|:------:|:------|:---------:|:-----------------:|-----:|:----|",
+        ]
+        for index, report in enumerate(reports, 1):
+            lines.append(
+                f"| {index} | {report['mode']} | {report['overall_status']} | "
+                f"`{report['model_id']}` | {report['vram_peak_gb']} GB | "
+                f"{format_pct(report.get('gpu_util_avg_pct'))}/"
+                f"{format_pct(report.get('gpu_util_peak_pct'))} | "
+                f"{report['elapsed_seconds']:.0f}s | {report['log_file']} |"
+            )
+
+    if pending:
+        lines += ["", "Pending:", ""]
+        lines += [f"- `{name}`" for name in pending[:50]]
+        if len(pending) > 50:
+            lines.append(f"- ... and {len(pending) - 50} more")
+
+    (results_dir / "progress.md").write_text("\n".join(lines) + "\n")
+
+
+def write_summary(
+    results_dir: Path,
+    reports: list[dict[str, Any]],
+    policy: str,
+) -> None:
+    passed = sum(r["overall_status"] == "PASSED" for r in reports)
+    failed = sum(r["overall_status"] == "FAILED" for r in reports)
+    errored = sum(r["overall_status"] == "ERROR" for r in reports)
+    total = len(reports)
+    rate = (100.0 * passed / total) if total else 0.0
+    icon = {"PASSED": "PASS", "FAILED": "FAIL", "ERROR": "ERR"}
+
+    lines = [
+        "# Radeon Local Notebook CI - Results",
+        "",
+        f"**{total} notebook jobs · {passed} PASS · {failed} FAIL · {errored} ERROR · {rate:.1f}% pass**",
+        "",
+        f"Policy: {policy}",
+    ]
+
+    for mode, title in (("native", "HF Native Notebooks"), ("fixed", "Radeon Fixed Notebooks")):
+        rows = [r for r in reports if r["mode"] == mode]
+        if not rows:
+            continue
+        lines += [
+            "",
+            f"## {title}",
+            "",
+            f"**{len(rows)} job(s) - "
+            f"{sum(r['overall_status'] == 'PASSED' for r in rows)} PASS / "
+            f"{sum(r['overall_status'] == 'FAILED' for r in rows)} FAIL / "
+            f"{sum(r['overall_status'] == 'ERROR' for r in rows)} ERROR**",
+            "",
+            "| # | Status | Model | Cells P/F/T | Peak VRAM | GPU util avg/peak | Time | Core error |",
+            "|--:|:------:|:------|:-----------:|:---------:|:-----------------:|-----:|:-----------|",
+        ]
+        for index, report in enumerate(rows, 1):
+            peak = report["vram_peak_gb"]
+            vram = f"{peak} / {VRAM_BUDGET_GB:.0f} GB ({100.0 * peak / VRAM_BUDGET_GB:.0f}%)"
+            lines.append(
+                f"| {index} | {icon[report['overall_status']]} | "
+                f"`{report['model_id']}` | "
+                f"{report['cells_passed']}/{report['cells_failed']}/{report['cells_total']} | "
+                f"{vram} | "
+                f"{format_pct(report.get('gpu_util_avg_pct'))}/"
+                f"{format_pct(report.get('gpu_util_peak_pct'))} | "
+                f"{report['elapsed_seconds']:.0f}s | {core_error(report)} |"
+            )
+
+    low_gpu = []
+    for report in reports:
+        if report["overall_status"] != "PASSED":
+            continue
+        reasons = []
+        if float(report.get("vram_peak_gb") or 0.0) < 1.0:
+            reasons.append("peak VRAM < 1 GB")
+        if float(report.get("gpu_util_peak_pct") or 0.0) < 10.0:
+            reasons.append("GPU util peak < 10%")
+        if reasons:
+            low_gpu.append((report, "; ".join(reasons)))
+
+    if low_gpu:
+        lines += [
+            "",
+            "## Passed With Low GPU Signal",
+            "",
+            "| Mode | Model | Peak VRAM | GPU util avg/peak | Reason |",
+            "|:----:|:------|:---------:|:-----------------:|:-------|",
+        ]
+        for report, reason in low_gpu:
+            lines.append(
+                f"| {report['mode']} | `{report['model_id']}` | "
+                f"{report['vram_peak_gb']} GB | "
+                f"{format_pct(report.get('gpu_util_avg_pct'))}/"
+                f"{format_pct(report.get('gpu_util_peak_pct'))} | {reason} |"
+            )
+
+    (results_dir / "summary.md").write_text("\n".join(lines) + "\n")
+    print(f"\nSummary: {passed}/{total} passed ({rate:.1f}%)", flush=True)
+
+
+def build_artifact_notebook(original: dict[str, Any], executed: dict[str, Any]) -> dict[str, Any]:
+    artifact = copy.deepcopy(original)
+    executed_cells = [
+        cell
+        for cell in executed.get("cells", [])
+        if cell.get("cell_type") == "code" and not cell.get("metadata", {}).get("ci_preamble")
+    ]
+    index = 0
+    for cell in artifact.get("cells", []):
+        if cell.get("cell_type") != "code":
+            continue
+        if index < len(executed_cells):
+            cell["outputs"] = executed_cells[index].get("outputs", [])
+            cell["execution_count"] = executed_cells[index].get("execution_count")
+        index += 1
+    return artifact
+
+
+def run_one(
+    target: Target,
+    mode: str,
+    args: argparse.Namespace,
+    results_dir: Path,
+) -> dict[str, Any]:
+    import nbformat
+    from nbclient import NotebookClient
+
+    artifact_name = f"{mode}__{target.notebook}"
+    log_path = results_dir / artifact_name.replace(".ipynb", ".log")
+
+    def emit(handle: Any, line: str, stdout: bool = False) -> None:
+        handle.write(line + "\n")
+        if stdout:
             print(line, flush=True)
 
-    def on_cell_start(cell, cell_index, **kw):
-        if cell.get("metadata", {}).get("ci_preamble"):
-            return
-        if progress is not None:
-            progress.set_cell(cell_index)
-        src = "".join(cell.get("source", []))
-        emit(f"\n----- cell {cell_index} -----")
-        emit(src.rstrip())
-        emit("----- output -----")
-
-    def on_cell_executed(cell, cell_index, execute_reply=None, **kw):
-        if cell.get("metadata", {}).get("ci_preamble"):
-            return
-        for o in cell.get("outputs", []):
-            t = o.get("output_type")
-            if t == "stream":
-                emit("".join(o.get("text", "")).rstrip(),
-                     to_stdout=args.echo_output)
-            elif t == "execute_result":
-                emit("".join(o.get("data", {}).get("text/plain", "")).rstrip(),
-                     to_stdout=args.echo_output)
-            elif t == "error":
-                # Errors ALWAYS echo to the CI step log (the debugging signal).
-                emit(f"[ERROR] {o.get('ename')}: {o.get('evalue')}",
-                     to_stdout=True)
-                for tb in o.get("traceback", []):
-                    emit(ANSI.sub("", tb).rstrip(), to_stdout=True)
-
-    peak, stop = [0], threading.Event()
-    th = threading.Thread(target=poll_vram, args=(stop, peak, progress),
-                          daemon=True)
-    th.start()
-
-    pod_error, exec_err = None, {}
-    # Pin the kernel subprocess to the right number of GPUs. The kernel inherits
-    # os.environ at launch (inside client.execute), and notebooks run strictly
-    # sequentially, so it is safe to set the vars here and restore them after.
-    _gpu_saved = {v: os.environ.get(v)
-                  for v in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")}
-    os.environ["HIP_VISIBLE_DEVICES"] = visible
-    os.environ["CUDA_VISIBLE_DEVICES"] = visible
-    client = NotebookClient(nb_node, timeout=args.cell_timeout,
-                            allow_errors=True, kernel_name="python3",
-                            on_cell_start=on_cell_start,
-                            on_cell_executed=on_cell_executed)
-
-    def _exec():
+    with log_path.open("w", buffering=1) as log:
+        started = time.time()
+        source_info: dict[str, str | None] = {"source": None, "fetched_url": None}
         try:
-            client.execute()
-        except Exception as e:
-            exec_err["msg"] = f"{type(e).__name__}: {e}"
+            original, source_info = load_notebook(target, mode)
+            normalized = normalize_notebook(original)
+            notebook = nbformat.from_dict(normalized)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            emit(log, f"# {artifact_name} ({target.model_id}) mode={mode}")
+            emit(log, f"# started {utc_now()}")
+            emit(log, f"[SOURCE-ERROR] {error}")
+            print(f"[SOURCE-ERROR] {mode} {target.model_id}: {compact_error(error, 300)}", flush=True)
+            report = make_report(target, mode, artifact_name, source_info, 0.0, {}, error, [])
+            save_json(results_dir / artifact_name.replace(".ipynb", ".json"), report)
+            return report
 
-    start = time.time()
-    worker = threading.Thread(target=_exec, daemon=True)
-    worker.start()
-    worker.join(args.nb_timeout)
-    if worker.is_alive():
-        pod_error = f"notebook timeout > {args.nb_timeout}s"
-        emit(f"[TIMEOUT] {pod_error}", to_stdout=True)
-        try:
-            if getattr(client, "km", None) is not None:
-                client.km.shutdown_kernel(now=True)
-        except Exception:
-            pass
-        worker.join(10)
-    elif "msg" in exec_err:
-        pod_error = exec_err["msg"]
-        emit(f"[KERNEL-ERROR] {pod_error}", to_stdout=True)
-    elapsed = round(time.time() - start, 1)
-    stop.set(); th.join(timeout=5)
-    for _v, _old in _gpu_saved.items():       # restore host GPU visibility
-        if _old is None:
-            os.environ.pop(_v, None)
-        else:
-            os.environ[_v] = _old
+        emit(log, f"# {artifact_name} ({target.model_id}) mode={mode}")
+        emit(log, f"# started {utc_now()}")
+        emit(log, f"# source={source_info.get('source')}")
+        emit(log, f"# fetched_url={source_info.get('fetched_url')}")
+        emit(log, "# visible_gpus=0\n")
 
-    cells, passed, failed = [], 0, 0
-    idx = 0
-    for cell in nb_node.cells:
-        if cell.get("cell_type") != "code":
-            continue
-        if cell.get("metadata", {}).get("ci_preamble"):
-            continue
-        idx += 1
-        err = next((o for o in cell.get("outputs", [])
-                    if o.get("output_type") == "error"), None)
-        if err:
-            failed += 1
-            cells.append({"index": idx, "status": "FAILED",
-                          "error": f'{err.get("ename")}: {err.get("evalue")}'})
-        else:
-            passed += 1
-            cells.append({"index": idx, "status": "PASSED", "error": None})
+        def on_cell_start(cell: dict[str, Any], cell_index: int, **_: Any) -> None:
+            if cell.get("metadata", {}).get("ci_preamble"):
+                return
+            emit(log, f"\n----- cell {cell_index} -----")
+            emit(log, "".join(cell.get("source", [])).rstrip())
+            emit(log, "----- output -----")
 
-    overall = "ERROR" if pod_error else ("PASSED" if failed == 0 else "FAILED")
-    emit(f"\n# RESULT {overall}  passed={passed} failed={failed} "
-         f"elapsed={elapsed}s peak_vram={round(peak[0] / 1e9, 1)}GB")
-    logf.close()
+        def on_cell_executed(cell: dict[str, Any], cell_index: int, **_: Any) -> None:
+            if cell.get("metadata", {}).get("ci_preamble"):
+                return
+            for output in cell.get("outputs", []):
+                kind = output.get("output_type")
+                if kind == "stream":
+                    emit(log, "".join(output.get("text", "")).rstrip(), args.echo_output)
+                elif kind == "execute_result":
+                    text = "".join(output.get("data", {}).get("text/plain", "")).rstrip()
+                    emit(log, text, args.echo_output)
+                elif kind == "error":
+                    core = compact_error(f"{output.get('ename')}: {output.get('evalue')}", 260)
+                    emit(log, f"[ERROR] cell {cell_index}: {core}", True)
+                    for traceback_line in output.get("traceback", []):
+                        emit(log, strip_ansi(traceback_line).rstrip(), args.echo_traceback)
 
-    artifact = nbformat.from_dict(original)
-    executed_code = [c for c in nb_node.cells
-                     if c.get("cell_type") == "code"
-                     and not c.get("metadata", {}).get("ci_preamble")]
-    j = 0
-    for cell in artifact.cells:
-        if cell.get("cell_type") != "code":
-            continue
-        if j < len(executed_code):
-            cell["outputs"] = executed_code[j].get("outputs", [])
-            cell["execution_count"] = executed_code[j].get("execution_count")
-        j += 1
-    out_nb = results_dir / nb_file
-    nbformat.write(artifact, str(out_nb))
-    subprocess.run(["jupyter", "nbconvert", "--to", "html", str(out_nb)],
-                   capture_output=True, text=True)
+        gpu_stats = {
+            "vram_peak_bytes": 0,
+            "gpu_util_sum_pct": 0.0,
+            "gpu_util_peak_pct": 0.0,
+            "gpu_util_samples": 0,
+        }
+        stop = threading.Event()
+        poller = threading.Thread(target=poll_gpu, args=(stop, gpu_stats), daemon=True)
+        poller.start()
 
-    report = {
-        "notebook": nb_file, "model_id": model_id, "local_path": local_path,
-        "storage": row.get("storage"), "gpus": row.get("gpus"),
-        "is_vl": vl, "overall_status": overall,
-        "cells_passed": passed, "cells_failed": failed,
-        "cells_total": passed + failed, "elapsed_seconds": elapsed,
-        "vram_peak_gb": round(peak[0] / 1e9, 1), "vram_total_gb": 96.0,
-        "log_file": log_path.name, "pod_error": pod_error, "cells": cells,
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-    }
-    (results_dir / nb_file.replace(".ipynb", ".json")).write_text(
-        json.dumps(report, indent=2))
-    print(f"[{overall:6}] {nb_file:55} "
-          f"cells {passed}/{passed + failed}  "
-          f"{report['vram_peak_gb']:>5} GB  {elapsed:>6}s"
-          + (f"  ({pod_error})" if pod_error else ""), flush=True)
+        saved_gpu_env = {
+            key: os.environ.get(key) for key in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES")
+        }
+        os.environ["HIP_VISIBLE_DEVICES"] = "0"
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+        run_error = None
+        exec_error: dict[str, str] = {}
+        client = NotebookClient(
+            notebook,
+            timeout=args.cell_timeout,
+            allow_errors=True,
+            kernel_name="python3",
+            on_cell_start=on_cell_start,
+            on_cell_executed=on_cell_executed,
+        )
+
+        def execute() -> None:
+            try:
+                client.execute()
+            except Exception as exc:
+                exec_error["message"] = f"{type(exc).__name__}: {exc}"
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        worker.join(args.notebook_timeout)
+        if worker.is_alive():
+            run_error = f"notebook timeout > {args.notebook_timeout}s"
+            emit(log, f"[TIMEOUT] {run_error}", True)
+            try:
+                if getattr(client, "km", None):
+                    client.km.shutdown_kernel(now=True)
+            except Exception:
+                pass
+            worker.join(10)
+        elif exec_error:
+            run_error = exec_error["message"]
+            emit(log, f"[KERNEL-ERROR] {run_error}", True)
+
+        elapsed = round(time.time() - started, 1)
+        stop.set()
+        poller.join(timeout=5)
+        for key, old_value in saved_gpu_env.items():
+            if old_value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = old_value
+
+        cells, passed, failed = collect_cell_results(notebook)
+        overall = "ERROR" if run_error else ("PASSED" if failed == 0 else "FAILED")
+        gpu_avg = None
+        if gpu_stats["gpu_util_samples"]:
+            gpu_avg = round(gpu_stats["gpu_util_sum_pct"] / gpu_stats["gpu_util_samples"], 1)
+        gpu_peak = (
+            round(gpu_stats["gpu_util_peak_pct"], 1)
+            if gpu_stats["gpu_util_samples"]
+            else None
+        )
+        vram_peak = round(gpu_stats["vram_peak_bytes"] / 1e9, 1)
+
+        emit(
+            log,
+            f"\n# RESULT {overall} passed={passed} failed={failed} elapsed={elapsed}s "
+            f"peak_vram={vram_peak}GB gpu_util_avg={format_pct(gpu_avg)} "
+            f"gpu_util_peak={format_pct(gpu_peak)}",
+        )
+
+    report = make_report(
+        target,
+        mode,
+        artifact_name,
+        source_info,
+        elapsed,
+        {
+            "vram_peak_gb": vram_peak,
+            "gpu_util_avg_pct": gpu_avg,
+            "gpu_util_peak_pct": gpu_peak,
+            "gpu_util_samples": gpu_stats["gpu_util_samples"],
+        },
+        run_error,
+        cells,
+        overall=overall,
+    )
+    save_json(results_dir / artifact_name.replace(".ipynb", ".json"), report)
+
+    output_notebook = results_dir / artifact_name
+    nbformat.write(nbformat.from_dict(build_artifact_notebook(original, notebook)), str(output_notebook))
+    subprocess.run(
+        ["jupyter", "nbconvert", "--to", "html", str(output_notebook)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    print(
+        f"[{overall:6}] {mode:6} {target.notebook:45} "
+        f"cells {passed}/{passed + failed}  {vram_peak:>5} GB  "
+        f"gpu {format_pct(gpu_avg)}/{format_pct(gpu_peak)}  {elapsed:>6}s",
+        flush=True,
+    )
     return report
 
 
-def write_summary(reports, results_dir):
-    n = len(reports)
-    npass = sum(r["overall_status"] == "PASSED" for r in reports)
-    nfail = sum(r["overall_status"] == "FAILED" for r in reports)
-    nerr = sum(r["overall_status"] == "ERROR" for r in reports)
-    rate = (100.0 * npass / n) if n else 0.0
-    icon = {"PASSED": "PASS", "FAILED": "FAIL", "ERROR": "ERR "}
-    lines = [
-        "# Radeon Local Notebook CI — Results (original_notebooks)", "",
-        f"**{n} notebooks · {npass} passed · {nfail} failed · {nerr} errored "
-        f"· {rate:.1f}% pass** (GPU 2+3, 96 GB budget)", "",
-        "| # | Status | Model | Notebook | VL | Cells P/F/T | Peak VRAM | Time | Notes |",
-        "|--:|:------:|:------|:---------|:--:|:-----------:|:---------:|-----:|:------|",
-    ]
-    for i, r in enumerate(sorted(reports, key=lambda x: x["notebook"]), 1):
-        note = r["pod_error"] or (
-            "" if r["overall_status"] == "PASSED"
-            else "; ".join(c["error"] for c in r["cells"]
-                           if c["status"] == "FAILED")[:120])
-        lines.append(
-            f"| {i} | {icon[r['overall_status']]} | `{r['model_id']}` | "
-            f"{r['notebook']} | {'Y' if r.get('is_vl') else ''} | "
-            f"{r['cells_passed']}/{r['cells_failed']}/{r['cells_total']} | "
-            f"{r['vram_peak_gb']} GB | {r['elapsed_seconds']:.0f}s | {note} |")
-    (results_dir / "summary.md").write_text("\n".join(lines) + "\n")
-    print(f"\nSummary: {npass}/{n} passed ({rate:.1f}%)", flush=True)
+def collect_cell_results(notebook: dict[str, Any]) -> tuple[list[dict[str, Any]], int, int]:
+    cells: list[dict[str, Any]] = []
+    passed = failed = 0
+    index = 0
+    for cell in notebook.get("cells", []):
+        if cell.get("cell_type") != "code" or cell.get("metadata", {}).get("ci_preamble"):
+            continue
+        index += 1
+        error = next((o for o in cell.get("outputs", []) if o.get("output_type") == "error"), None)
+        if error:
+            failed += 1
+            cells.append(
+                {
+                    "index": index,
+                    "status": "FAILED",
+                    "error": f"{error.get('ename')}: {error.get('evalue')}",
+                }
+            )
+        else:
+            passed += 1
+            cells.append({"index": index, "status": "PASSED", "error": None})
+    return cells, passed, failed
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--results-dir", default="results")
-    ap.add_argument("--filter", default="",
-                    help="substring match on notebook name or model id")
-    ap.add_argument("--cell-timeout", type=int, default=900)
-    ap.add_argument("--nb-timeout", type=int, default=1800)
-    ap.add_argument("--keep-pip", action="store_true")
-    ap.add_argument("--include-ineligible", action="store_true",
-                    help="also run notebooks marked eligible=no (OOM/incomplete)")
-    ap.add_argument("--max-gpus", type=int, default=1,
-                    help="only run models needing <= this many GPUs "
-                         "(default 1 = single-card only)")
-    ap.add_argument("--no-skip-passed", action="store_true",
-                    help="ignore doc/skip_since_it_pass_list.csv and run "
-                         "everything (default: skip already-passed notebooks)")
-    ap.add_argument("--order", choices=["size", "name"], default="size",
-                    help="run order: 'size' = smallest model first (default)")
-    ap.add_argument("--echo-output", action="store_true",
-                    help="also echo successful cell output to stdout (errors are "
-                         "always echoed); per-notebook .log always has full output")
-    ap.add_argument("--env-file", default="",
-                    help="KEY=VALUE file of extra env (HF_TOKEN, HF_ENDPOINT, "
-                         "proxies) injected before each notebook; host-local, "
-                         "never committed. Defaults to RADEON_CI_ENV_FILE or "
-                         f"{DEFAULT_ENV_FILE}")
-    args = ap.parse_args()
+def make_report(
+    target: Target,
+    mode: str,
+    artifact_name: str,
+    source_info: dict[str, str | None],
+    elapsed: float,
+    gpu: dict[str, Any],
+    run_error: str | None,
+    cells: list[dict[str, Any]],
+    overall: str | None = None,
+) -> dict[str, Any]:
+    passed = sum(cell["status"] == "PASSED" for cell in cells)
+    failed = sum(cell["status"] == "FAILED" for cell in cells)
+    if overall is None:
+        overall = "ERROR" if run_error else ("PASSED" if failed == 0 else "FAILED")
+    return {
+        "mode": mode,
+        "model_id": target.model_id,
+        "notebook": target.notebook,
+        "artifact_notebook": artifact_name,
+        "source": source_info.get("source"),
+        "fetched_url": source_info.get("fetched_url"),
+        "overall_status": overall,
+        "cells_passed": passed,
+        "cells_failed": failed,
+        "cells_total": passed + failed,
+        "elapsed_seconds": elapsed,
+        "vram_peak_gb": gpu.get("vram_peak_gb", 0.0),
+        "gpu_util_avg_pct": gpu.get("gpu_util_avg_pct"),
+        "gpu_util_peak_pct": gpu.get("gpu_util_peak_pct"),
+        "gpu_util_samples": gpu.get("gpu_util_samples", 0),
+        "vram_budget_gb": VRAM_BUDGET_GB,
+        "log_file": artifact_name.replace(".ipynb", ".log"),
+        "run_error": run_error,
+        "cells": cells,
+        "finished_at": utc_now(),
+    }
 
+
+def jobs_for(targets: list[Target], mode: str) -> list[tuple[str, Target]]:
+    return [(mode, target) for target in targets]
+
+
+def validate_plan(jobs: list[tuple[str, Target]]) -> list[str]:
+    errors: list[str] = []
+    print(f"Plan contains {len(jobs)} notebook job(s).", flush=True)
+    for mode, target in jobs:
+        try:
+            notebook, source = load_notebook(target, mode)
+            code_cells = sum(cell.get("cell_type") == "code" for cell in notebook.get("cells", []))
+            fetched = source.get("fetched_url") or source.get("source")
+            print(
+                f"[PLAN OK] {mode:6} {target.model_id:45} "
+                f"{target.notebook:45} code_cells={code_cells:02d} source={fetched}",
+                flush=True,
+            )
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            errors.append(error)
+            print(
+                f"[PLAN ERR] {mode:6} {target.model_id:45} "
+                f"{target.notebook:45} {compact_error(error, 240)}",
+                flush=True,
+            )
+    return errors
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results-dir", default="results")
+    parser.add_argument("--target-file", default=str(TARGET_CSV))
+    parser.add_argument("--mode", choices=["native", "fixed", "both"], default="both")
+    parser.add_argument(
+        "--fixed-scope",
+        choices=["all", "failed-native"],
+        default="all",
+        help="when mode=both, run fixed notebooks for all targets or native failures only",
+    )
+    parser.add_argument(
+        "--fail-on",
+        choices=["all", "fixed", "none"],
+        default="all",
+        help="which failures should make the process exit non-zero",
+    )
+    parser.add_argument("--filter", default="")
+    parser.add_argument("--plan-only", action="store_true")
+    parser.add_argument("--cell-timeout", type=int, default=900)
+    parser.add_argument("--notebook-timeout", type=int, default=1800)
+    parser.add_argument("--echo-output", action="store_true")
+    parser.add_argument("--echo-traceback", action="store_true")
+    parser.add_argument(
+        "--env-file",
+        default="",
+        help=f"optional KEY=VALUE env file for HF_TOKEN/proxy settings; default {DEFAULT_ENV_FILE}",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
-    mapping = load_mapping()
-    skip_passed = set() if args.no_skip_passed else load_skip_passed()
 
-    # Inject host-local env (token / proxy / endpoint) so every kernel inherits
-    # it. The token never enters a notebook cell, an artifact, or git.
-    env_path = args.env_file or DEFAULT_ENV_FILE
-    extra_env = load_local_env(env_path)
-    if extra_env:
-        os.environ.update(extra_env)
-        shown = ", ".join(f"{k}={_mask(k, v)}" for k, v in extra_env.items())
-        print(f"[env] loaded {len(extra_env)} var(s) from {env_path}: {shown}",
-              flush=True)
-        # Network intentionally allowed (proxy/token provided): do NOT force
-        # offline, so notebooks can fetch images etc. Local weights still load
-        # from /disk because ids are rewritten to absolute paths.
-        os.environ.pop("HF_HUB_OFFLINE", None)
-        os.environ.pop("TRANSFORMERS_OFFLINE", None)
-        print("[env] network ENABLED (offline flags cleared)", flush=True)
+    load_env_file(args.env_file or DEFAULT_ENV_FILE)
+    if not args.plan_only:
+        assert_jpeg_support()
+
+    targets = load_targets(Path(args.target_file), args.filter)
+    if not targets:
+        raise SystemExit(f"no enabled targets matched filter {args.filter!r}")
+
+    native_jobs = jobs_for(targets, "native") if args.mode in {"native", "both"} else []
+    fixed_jobs = jobs_for(targets, "fixed") if args.mode == "fixed" else []
+    if args.plan_only and args.mode == "both":
+        fixed_jobs = jobs_for(targets, "fixed")
+
+    if args.plan_only:
+        errors = validate_plan(native_jobs + fixed_jobs)
+        raise SystemExit(1 if errors else 0)
+
+    if args.mode == "native":
+        phases = [("HF native notebooks", native_jobs)]
+    elif args.mode == "fixed":
+        phases = [("Radeon fixed notebooks", fixed_jobs)]
     else:
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-        print(f"[env] no env file at {env_path}; running fully OFFLINE",
-              flush=True)
+        phases = [("HF native notebooks", native_jobs)]
 
-    def gpus_of(row):
-        try:
-            return int(row.get("gpus") or 99)
-        except (TypeError, ValueError):
-            return 99
+    policy = (
+        f"mode={args.mode}; fixed_scope={args.fixed_scope}; fail_on={args.fail_on}; "
+        "single Radeon GPU; model ids load through mounted Hugging Face cache"
+    )
+    reports: list[dict[str, Any]] = []
+    pending = [f"{mode}__{target.notebook}" for _, jobs in phases for mode, target in jobs]
+    write_progress(results_dir, reports, pending)
 
-    todo, skipped = [], []
-    for nb_file in sorted(mapping):
-        row = mapping[nb_file]
-        if args.filter and args.filter.lower() not in (
-                nb_file + " " + row["model_id"]).lower():
-            continue
-        if nb_file in skip_passed:
-            skipped.append({"notebook": nb_file, "model": row["model_id"],
-                            "reason": "already passed (skip list)",
-                            "gpus": row.get("gpus", "")})
-            print(f"[SKIP  ] {nb_file:55} (already passed -- skip list)",
-                  flush=True)
-            continue
-        if not args.include_ineligible and row.get("eligible") != "yes":
-            reason = row.get("download_status") or "ineligible"
-            skipped.append({"notebook": nb_file, "model": row["model_id"],
-                            "reason": reason, "gpus": row.get("gpus", "")})
-            print(f"[SKIP  ] {nb_file:55} ({reason}, gpus={row.get('gpus')})",
-                  flush=True)
-            continue
-        if gpus_of(row) > args.max_gpus:
-            skipped.append({"notebook": nb_file, "model": row["model_id"],
-                            "reason": f"needs {row.get('gpus')} GPUs "
-                                      f"(> max_gpus={args.max_gpus})",
-                            "gpus": row.get("gpus", "")})
-            print(f"[SKIP  ] {nb_file:55} (needs {row.get('gpus')} GPUs "
-                  f"> max {args.max_gpus})", flush=True)
-            continue
-        todo.append((nb_file, row))
+    print(
+        f"Running Radeon notebook CI: mode={args.mode}, fixed_scope={args.fixed_scope}, "
+        f"targets={len(targets)}, HF_ENDPOINT={os.environ.get('HF_ENDPOINT', '')}",
+        flush=True,
+    )
 
-    if args.order == "size":
-        def _sz(item):
-            lp = item[1].get("local_path", "")
-            try:
-                return sum(f.stat().st_size for f in Path(lp).rglob("*")
-                           if f.is_file())
-            except Exception:
-                return float("inf")
-        todo.sort(key=_sz)
+    def run_phase(title: str, jobs: list[tuple[str, Target]]) -> None:
+        print(f"\n==> PHASE {title}: {len(jobs)} job(s)", flush=True)
+        for mode, target in jobs:
+            run_name = f"{mode}__{target.notebook}"
+            if run_name in pending:
+                pending.remove(run_name)
+            print(f"==> START {run_name} ({target.model_id})", flush=True)
+            write_progress(results_dir, reports, pending, running=run_name)
+            report = run_one(target, mode, args, results_dir)
+            reports.append(report)
+            write_summary(results_dir, reports, policy)
+            write_progress(results_dir, reports, pending)
 
-    total = len(todo)
-    progress = Progress(results_dir, total, skipped, args.max_gpus)
-    progress.set_pending([nb for nb, _ in todo])
+    for title, phase_jobs in phases:
+        run_phase(title, phase_jobs)
 
-    print(f"Running {total} notebook(s) on GPU 2+3 "
-          f"(max_gpus={args.max_gpus}, order={args.order}); "
-          f"{len(skipped)} skipped.\n", flush=True)
+    if args.mode == "both":
+        native_failures = {
+            report["model_id"]
+            for report in reports
+            if report["mode"] == "native" and report["overall_status"] != "PASSED"
+        }
+        if args.fixed_scope == "failed-native":
+            fixed_targets = [target for target in targets if target.model_id in native_failures]
+        else:
+            fixed_targets = targets
+        fixed_jobs = jobs_for(fixed_targets, "fixed")
+        run_phase("Radeon fixed notebooks", fixed_jobs)
 
-    reports = []
-    for i, (nb_file, row) in enumerate(todo, 1):
-        print(f"==> [{i}/{total}] START {nb_file}  ({row['model_id']})  "
-              f"log: results/{nb_file.replace('.ipynb', '.log')}", flush=True)
-        progress.start_model(i, nb_file, row["model_id"], row.get("gpus"))
-        report = run_one(nb_file, row, args, results_dir, progress)
-        progress.finish_model(report)
-        reports.append(report)
-        npass = sum(r["overall_status"] == "PASSED" for r in reports)
-        nfail = sum(r["overall_status"] == "FAILED" for r in reports)
-        nerr = sum(r["overall_status"] == "ERROR" for r in reports)
-        print(f"    PROGRESS {i}/{total}  ok={npass} fail={nfail} err={nerr}",
-              flush=True)
-        write_summary(reports, results_dir)
-    write_summary(reports, results_dir)
+    write_summary(results_dir, reports, policy)
+
+    if args.fail_on == "none":
+        return
+    failing = [
+        report
+        for report in reports
+        if report["overall_status"] != "PASSED"
+        and (args.fail_on == "all" or report["mode"] == "fixed")
+    ]
+    if failing:
+        print(f"\nFailing CI because {len(failing)} {args.fail_on} job(s) did not pass:", flush=True)
+        for report in failing:
+            print(
+                f"- {report['mode']} {report['model_id']} "
+                f"({report['overall_status']}, log={report['log_file']})",
+                flush=True,
+            )
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

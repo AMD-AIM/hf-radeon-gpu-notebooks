@@ -4,3 +4,5 @@ ci_local.env
 *.local.env
 __pycache__/
 *.pyc
+results/
+.ipynb_checkpoints/

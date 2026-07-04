@@ -1,9 +1,0 @@
-{
-  "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/p-blog/candy.JPG": "candy_23d256.JPG",
-  "https://cdn.britannica.com/61/93061-050-99147DCE/Statue-of-Liberty-Island-New-York-Bay.jpg": "Statue-of-Liberty-Island-New-York-Bay_8ade09.jpg",
-  "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/hub/parrots.png": "parrots_af1f6d.png",
-  "https://huggingface.co/datasets/merve/vlm_test_images/resolve/main/reasoning_2.png": "reasoning_2_ef8ad5.png",
-  "https://huggingface.co/datasets/merve/vlm_test_images/resolve/main/reasoning_ss.png": "reasoning_ss_27f343.png",
-  "https://raw.githubusercontent.com/THUDM/GLM-4.1V-Thinking/8042d3275bac41e4c6c434cec6e69f23e5b9cb82/resources/agent.jpg": "agent_500a09.jpg",
-  "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/cat.png": "cat_b7dea3.png"
-}
