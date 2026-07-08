@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Hugging Face native and Radeon-fixed notebooks for the local W7900 CI."""
+"""Run Hugging Face Oneclick notebooks for the local W7900 CI."""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from typing import Any
 
 REPO = Path(__file__).resolve().parents[1]
 TARGET_CSV = REPO / "doc" / "ci_target_models.csv"
-FIXED_NOTEBOOK_DIR = REPO / "radeon_notebooks"
 ORIGINAL_NOTEBOOK_DIR = REPO / "original_notebooks"
 SOURCE_DATA_DIR = REPO / "source_data"
 SOURCE_MAP_JSON = SOURCE_DATA_DIR / "resource_map.json"
@@ -253,8 +252,8 @@ def native_notebook_urls(model_id: str) -> list[str]:
 
 
 def read_text_url(url: str, timeout: int = 120) -> str:
-    headers = {"User-Agent": "radeon-local-notebook-ci"}
-    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    headers = {"User-Agent": "huggingface-oneclick-notebook-ci"}
+    token = runtime_hf_token()
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers)
@@ -310,7 +309,7 @@ def write_original_notebook_snapshot(
 
     snapshot_path.write_text(raw_text)
     print(
-        f"[native-sync] updated {display_path(snapshot_path)} from downloaded notebook",
+        f"[oneclick-sync] updated {display_path(snapshot_path)} from downloaded notebook",
         flush=True,
     )
     return display_path(snapshot_path)
@@ -318,67 +317,57 @@ def write_original_notebook_snapshot(
 
 def load_notebook(
     target: Target,
-    mode: str,
     sync_native_snapshot: bool = True,
 ) -> tuple[dict[str, Any], dict[str, str | None]]:
-    if mode == "native":
-        errors: list[str] = []
-        for url in native_notebook_urls(target.model_id):
-            for attempt in range(1, 4):
-                try:
-                    raw_text = read_text_url(url)
-                    notebook = parse_notebook_json(raw_text, url)
-                    snapshot = (
-                        write_original_notebook_snapshot(target, raw_text, notebook)
-                        if sync_native_snapshot
-                        else display_path(ORIGINAL_NOTEBOOK_DIR / target.notebook)
-                    )
-                    return notebook, {
-                        "source": f"{HF_CANONICAL}/{target.model_id}.ipynb",
-                        "fetched_url": url,
-                        "snapshot": snapshot,
-                    }
-                except (
-                    OSError,
-                    TimeoutError,
-                    ValueError,
-                    urllib.error.URLError,
-                    json.JSONDecodeError,
-                    UnicodeDecodeError,
-                ) as exc:
-                    errors.append(f"{url} attempt {attempt}: {type(exc).__name__}: {exc}")
-                    time.sleep(min(attempt * 2, 5))
-
-        fallback_path = ORIGINAL_NOTEBOOK_DIR / target.notebook
-        if fallback_path.is_file():
+    errors: list[str] = []
+    for url in native_notebook_urls(target.model_id):
+        for attempt in range(1, 4):
             try:
-                notebook = parse_notebook_json(fallback_path.read_text(), str(fallback_path))
-            except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-                errors.append(
-                    f"{display_path(fallback_path)} fallback: "
-                    f"{type(exc).__name__}: {exc}"
-                )
-            else:
-                print(
-                    f"[native-fallback] using {display_path(fallback_path)} after "
-                    "download failure",
-                    flush=True,
+                raw_text = read_text_url(url)
+                notebook = parse_notebook_json(raw_text, url)
+                snapshot = (
+                    write_original_notebook_snapshot(target, raw_text, notebook)
+                    if sync_native_snapshot
+                    else display_path(ORIGINAL_NOTEBOOK_DIR / target.notebook)
                 )
                 return notebook, {
-                    "source": display_path(fallback_path),
-                    "fetched_url": None,
-                    "snapshot": display_path(fallback_path),
+                    "source": f"{HF_CANONICAL}/{target.model_id}.ipynb",
+                    "fetched_url": url,
+                    "snapshot": snapshot,
                 }
+            except (
+                OSError,
+                TimeoutError,
+                ValueError,
+                urllib.error.URLError,
+                json.JSONDecodeError,
+                UnicodeDecodeError,
+            ) as exc:
+                errors.append(f"{url} attempt {attempt}: {type(exc).__name__}: {exc}")
+                time.sleep(min(attempt * 2, 5))
 
-        raise RuntimeError("could not download native notebook: " + " | ".join(errors))
+    fallback_path = ORIGINAL_NOTEBOOK_DIR / target.notebook
+    if fallback_path.is_file():
+        try:
+            notebook = parse_notebook_json(fallback_path.read_text(), str(fallback_path))
+        except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            errors.append(
+                f"{display_path(fallback_path)} fallback: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        else:
+            print(
+                f"[oneclick-fallback] using {display_path(fallback_path)} after "
+                "download failure",
+                flush=True,
+            )
+            return notebook, {
+                "source": display_path(fallback_path),
+                "fetched_url": None,
+                "snapshot": display_path(fallback_path),
+            }
 
-    path = FIXED_NOTEBOOK_DIR / target.notebook
-    if not path.is_file():
-        raise FileNotFoundError(f"fixed notebook not found: {path}")
-    return json.loads(path.read_text()), {
-        "source": display_path(path),
-        "fetched_url": None,
-    }
+    raise RuntimeError("could not download Hugging Face notebook: " + " | ".join(errors))
 
 
 def assert_jpeg_support() -> None:
@@ -443,15 +432,6 @@ def runtime_hf_token() -> str:
     return ""
 
 
-def inject_fixed_hf_token(source: str, token: str) -> str:
-    if not token:
-        return source
-    return HF_TOKEN_PLACEHOLDER_RE.sub(
-        rf"\1{token!r}  # [ci-injected-hf-token]",
-        source,
-    )
-
-
 def should_skip_remote_or_auth(source: str) -> bool:
     if REMOTE_ONLY_RE.search(source):
         return True
@@ -491,12 +471,8 @@ def rewrite_source_data_urls(source: str) -> str:
     return source
 
 
-def normalize_notebook(
-    notebook: dict[str, Any],
-    mode: str,
-) -> dict[str, Any]:
+def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(notebook)
-    fixed_hf_token = runtime_hf_token() if mode == "fixed" else ""
     in_remote_section = False
     cells: list[dict[str, Any]] = [
         {
@@ -518,9 +494,6 @@ def normalize_notebook(
             continue
 
         source = "".join(cell.get("source", []))
-        if mode == "fixed":
-            source = inject_fixed_hf_token(source, fixed_hf_token)
-
         if should_skip_remote_or_auth(source):
             source = comment_cell(source, "remote-or-auth")
         elif PIP_INSTALL_RE.search(source):
@@ -679,7 +652,7 @@ def write_progress(
     failed = sum(r["overall_status"] == "FAILED" for r in reports)
     errored = sum(r["overall_status"] == "ERROR" for r in reports)
     lines = [
-        "# Radeon Notebook CI Progress",
+        "# Hugging Face Oneclick Notebook CI Progress",
         "",
         f"_updated {utc_now()}_",
         "",
@@ -739,7 +712,7 @@ def write_summary(
         )
 
     lines = [
-        "# Radeon Local Notebook CI - Results",
+        "# Hugging Face Oneclick Notebook CI - Results",
         "",
         f"**{total} notebook jobs · {passed} PASS · {failed} FAIL · {errored} ERROR · "
         f"{rate:.1f}% pass · CI wall time {format_duration(wall_elapsed)} · "
@@ -755,27 +728,23 @@ def write_summary(
         "| Scope | Jobs | Total Time | Avg / Job | Fastest | Slowest |",
         "|:------|-----:|-----------:|----------:|--------:|--------:|",
         timing_row("All", reports),
-        timing_row("HF Native Notebooks", [r for r in reports if r["mode"] == "native"]),
-        timing_row("Radeon Fixed Notebooks", [r for r in reports if r["mode"] == "fixed"]),
+        timing_row("HF Oneclick Notebooks", reports),
     ]
 
-    for mode, title in (("native", "HF Native Notebooks"), ("fixed", "Radeon Fixed Notebooks")):
-        rows = [r for r in reports if r["mode"] == mode]
-        if not rows:
-            continue
+    if reports:
         lines += [
             "",
-            f"## {title}",
+            "## HF Oneclick Notebooks",
             "",
-            f"**{len(rows)} job(s) - "
-            f"{sum(r['overall_status'] == 'PASSED' for r in rows)} PASS / "
-            f"{sum(r['overall_status'] == 'FAILED' for r in rows)} FAIL / "
-            f"{sum(r['overall_status'] == 'ERROR' for r in rows)} ERROR**",
+            f"**{len(reports)} job(s) - "
+            f"{sum(r['overall_status'] == 'PASSED' for r in reports)} PASS / "
+            f"{sum(r['overall_status'] == 'FAILED' for r in reports)} FAIL / "
+            f"{sum(r['overall_status'] == 'ERROR' for r in reports)} ERROR**",
             "",
             "| # | Status | Model | Cells P/F/T | Peak VRAM | GPU util avg/peak | Time | Core error |",
             "|--:|:------:|:------|:-----------:|:---------:|:-----------------:|-----:|:-----------|",
         ]
-        for index, report in enumerate(rows, 1):
+        for index, report in enumerate(reports, 1):
             peak = report["vram_peak_gb"]
             vram = f"{peak} / {VRAM_BUDGET_GB:.0f} GB ({100.0 * peak / VRAM_BUDGET_GB:.0f}%)"
             lines.append(
@@ -835,13 +804,13 @@ def build_artifact_notebook(original: dict[str, Any], executed: dict[str, Any]) 
 
 def run_one(
     target: Target,
-    mode: str,
     args: argparse.Namespace,
     results_dir: Path,
 ) -> dict[str, Any]:
     import nbformat
     from nbclient import NotebookClient
 
+    mode = "oneclick"
     artifact_name = f"{mode}__{target.notebook}"
     log_path = results_dir / artifact_name.replace(".ipynb", ".log")
 
@@ -855,8 +824,8 @@ def run_one(
         started = time.time()
         source_info: dict[str, str | None] = {"source": None, "fetched_url": None}
         try:
-            original, source_info = load_notebook(target, mode)
-            normalized = normalize_notebook(original, mode)
+            original, source_info = load_notebook(target)
+            normalized = normalize_notebook(original)
             notebook = nbformat.from_dict(normalized)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
@@ -1074,17 +1043,13 @@ def make_report(
     }
 
 
-def jobs_for(targets: list[Target], mode: str) -> list[tuple[str, Target]]:
-    return [(mode, target) for target in targets]
-
-
-def validate_plan(jobs: list[tuple[str, Target]]) -> list[str]:
+def validate_plan(targets: list[Target]) -> list[str]:
     errors: list[str] = []
-    print(f"Plan contains {len(jobs)} notebook job(s).", flush=True)
-    for mode, target in jobs:
+    print(f"Plan contains {len(targets)} notebook job(s).", flush=True)
+    for target in targets:
         try:
-            notebook, source = load_notebook(target, mode, sync_native_snapshot=False)
-            normalized = normalize_notebook(notebook, mode)
+            notebook, source = load_notebook(target, sync_native_snapshot=False)
+            normalized = normalize_notebook(notebook)
             code_cells = sum(
                 cell.get("cell_type") == "code"
                 and not cell.get("metadata", {}).get("ci_preamble")
@@ -1092,7 +1057,7 @@ def validate_plan(jobs: list[tuple[str, Target]]) -> list[str]:
             )
             fetched = source.get("fetched_url") or source.get("source")
             print(
-                f"[PLAN OK] {mode:6} {target.model_id:45} "
+                f"[PLAN OK] oneclick {target.model_id:45} "
                 f"{target.notebook:45} code_cells={code_cells:02d} source={fetched}",
                 flush=True,
             )
@@ -1100,7 +1065,7 @@ def validate_plan(jobs: list[tuple[str, Target]]) -> list[str]:
             error = f"{type(exc).__name__}: {exc}"
             errors.append(error)
             print(
-                f"[PLAN ERR] {mode:6} {target.model_id:45} "
+                f"[PLAN ERR] oneclick {target.model_id:45} "
                 f"{target.notebook:45} {compact_error(error, 240)}",
                 flush=True,
             )
@@ -1111,11 +1076,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--target-file", default=str(TARGET_CSV))
-    parser.add_argument("--mode", choices=["native", "fixed", "both"], default="both")
     parser.add_argument(
         "--fail-on",
-        choices=["all", "fixed", "none"],
-        default="all",
+        choices=["all", "none"],
+        default="none",
         help="which failures should make the process exit non-zero",
     )
     parser.add_argument("--filter", default="")
@@ -1145,52 +1109,35 @@ def main() -> None:
     if not targets:
         raise SystemExit(f"no enabled targets matched filter {args.filter!r}")
 
-    native_jobs = jobs_for(targets, "native") if args.mode in {"native", "both"} else []
-    fixed_jobs = jobs_for(targets, "fixed") if args.mode in {"fixed", "both"} else []
-
     if args.plan_only:
-        errors = validate_plan(native_jobs + fixed_jobs)
+        errors = validate_plan(targets)
         raise SystemExit(1 if errors else 0)
 
-    if args.mode == "native":
-        phases = [("HF native notebooks", native_jobs)]
-    elif args.mode == "fixed":
-        phases = [("Radeon fixed notebooks", fixed_jobs)]
-    else:
-        phases = [
-            ("HF native notebooks", native_jobs),
-            ("Radeon fixed notebooks", fixed_jobs),
-        ]
-
     policy = (
-        f"mode={args.mode}; fail_on={args.fail_on}; "
+        f"source=hf-oneclick; fail_on={args.fail_on}; "
         "single Radeon GPU; model ids load through mounted Hugging Face cache"
     )
     reports: list[dict[str, Any]] = []
-    pending = [f"{mode}__{target.notebook}" for _, jobs in phases for mode, target in jobs]
+    pending = [f"oneclick__{target.notebook}" for target in targets]
     write_progress(results_dir, reports, pending)
 
     print(
-        f"Running Radeon notebook CI: mode={args.mode}, targets={len(targets)}, "
+        f"Running Hugging Face Oneclick notebook CI: targets={len(targets)}, "
         f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT', '')}",
         flush=True,
     )
 
-    def run_phase(title: str, jobs: list[tuple[str, Target]]) -> None:
-        print(f"\n==> PHASE {title}: {len(jobs)} job(s)", flush=True)
-        for mode, target in jobs:
-            run_name = f"{mode}__{target.notebook}"
-            if run_name in pending:
-                pending.remove(run_name)
-            print(f"==> START {run_name} ({target.model_id})", flush=True)
-            write_progress(results_dir, reports, pending, running=run_name)
-            report = run_one(target, mode, args, results_dir)
-            reports.append(report)
-            write_summary(results_dir, reports, policy)
-            write_progress(results_dir, reports, pending)
-
-    for title, phase_jobs in phases:
-        run_phase(title, phase_jobs)
+    print(f"\n==> PHASE HF Oneclick notebooks: {len(targets)} job(s)", flush=True)
+    for target in targets:
+        run_name = f"oneclick__{target.notebook}"
+        if run_name in pending:
+            pending.remove(run_name)
+        print(f"==> START {run_name} ({target.model_id})", flush=True)
+        write_progress(results_dir, reports, pending, running=run_name)
+        report = run_one(target, args, results_dir)
+        reports.append(report)
+        write_summary(results_dir, reports, policy)
+        write_progress(results_dir, reports, pending)
 
     write_summary(results_dir, reports, policy)
 
@@ -1200,7 +1147,6 @@ def main() -> None:
         report
         for report in reports
         if report["overall_status"] != "PASSED"
-        and (args.fail_on == "all" or report["mode"] == "fixed")
     ]
     if failing:
         print(f"\nFailing CI because {len(failing)} {args.fail_on} job(s) did not pass:", flush=True)
