@@ -3,12 +3,23 @@ name: radeon-local-notebook-ci
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Notebook source to test"
+        type: choice
+        options:
+          - native
+          - fixed
+          - both
+        default: both
       filter:
         description: "Substring filter on model id / notebook name (blank = all)"
         required: false
         default: ""
   push:
     branches: [main, "ci/**"]
+
+permissions:
+  contents: write
 
 concurrency:
   group: radeon-local-ci
@@ -26,11 +37,13 @@ jobs:
         timeout-minutes: 15
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
+          persist-credentials: true
           clean: false
           sparse-checkout: |
             .github
             doc
+            original_notebooks
             radeon_notebooks
             source_data
             tools
@@ -58,12 +71,20 @@ jobs:
 
       - name: Execute notebook CI
         env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
           INPUT_FILTER: ${{ github.event.inputs.filter }}
         run: |
           rm -rf results
           mkdir -p results
 
+          MODE="${INPUT_MODE:-both}"
           FILTER="${INPUT_FILTER:-}"
+          case "$MODE" in
+            native) FAIL_ON="none" ;;
+            fixed) FAIL_ON="all" ;;
+            both) FAIL_ON="fixed" ;;
+            *) echo "::error::Unsupported mode: $MODE"; exit 1 ;;
+          esac
 
           SELECTED_RENDER_NODE="${{ steps.select_gpu.outputs.render_node }}"
           if [ -z "$SELECTED_RENDER_NODE" ]; then
@@ -91,6 +112,8 @@ jobs:
             -e HF_HUB_CACHE="$HF_CACHE_ROOT/hub" \
             -e HF_DATASETS_CACHE="$HF_CACHE_ROOT/datasets" \
             -e TRANSFORMERS_CACHE="$HF_CACHE_ROOT/transformers" \
+            -e CI_MODE="$MODE" \
+            -e CI_FAIL_ON="$FAIL_ON" \
             -e CI_FILTER="$FILTER" \
             -e RADEON_CI_RENDER_NODE="$SELECTED_RENDER_NODE" \
             -e RADEON_CI_GPU_CARD="${{ steps.select_gpu.outputs.card_index }}" \
@@ -101,11 +124,39 @@ jobs:
             -lc 'args=(
                   --results-dir results
                   --target-file doc/ci_target_models.csv
-                  --mode both
-                  --fail-on fixed
+                  --mode "$CI_MODE"
+                  --fail-on "$CI_FAIL_ON"
                 )
                 if [ -n "$CI_FILTER" ]; then args+=(--filter "$CI_FILTER"); fi
                 python3 -u tools/run_notebooks.py "${args[@]}"'
+
+      - name: Sync downloaded native notebook snapshots
+        if: always() && github.ref == 'refs/heads/main'
+        env:
+          INPUT_MODE: ${{ github.event.inputs.mode }}
+        run: |
+          MODE="${INPUT_MODE:-both}"
+          if [ "$MODE" != "native" ] && [ "$MODE" != "both" ]; then
+            echo "No native notebook phase ran; skip original_notebooks sync."
+            exit 0
+          fi
+
+          if [ ! -d original_notebooks ]; then
+            echo "original_notebooks was not created; nothing to sync."
+            exit 0
+          fi
+
+          git add original_notebooks
+          if git diff --cached --quiet -- original_notebooks; then
+            echo "No downloaded notebook snapshot changes."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update original notebooks from Hugging Face [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
 
       - name: Tear down CI container
         if: always()

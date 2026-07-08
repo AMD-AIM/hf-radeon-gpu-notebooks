@@ -24,6 +24,7 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 TARGET_CSV = REPO / "doc" / "ci_target_models.csv"
 FIXED_NOTEBOOK_DIR = REPO / "radeon_notebooks"
+ORIGINAL_NOTEBOOK_DIR = REPO / "original_notebooks"
 SOURCE_DATA_DIR = REPO / "source_data"
 SOURCE_MAP_JSON = SOURCE_DATA_DIR / "resource_map.json"
 DEFAULT_ENV_FILE = os.environ.get(
@@ -251,42 +252,131 @@ def native_notebook_urls(model_id: str) -> list[str]:
     return list(dict.fromkeys(urls))
 
 
-def read_json_url(url: str, timeout: int = 120) -> Any:
+def read_text_url(url: str, timeout: int = 120) -> str:
     headers = {"User-Agent": "radeon-local-notebook-ci"}
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
+        return response.read().decode("utf-8")
 
 
-def load_notebook(target: Target, mode: str) -> tuple[dict[str, Any], dict[str, str | None]]:
+def parse_notebook_json(raw_text: str, source: str) -> dict[str, Any]:
+    notebook = json.loads(raw_text)
+    cells = notebook.get("cells") if isinstance(notebook, dict) else None
+    if not isinstance(cells, list) or not cells:
+        raise ValueError(f"{source} is not a valid notebook JSON document")
+    return notebook
+
+
+def display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(REPO))
+    except ValueError:
+        return str(path)
+
+
+def canonical_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
+    canonical = copy.deepcopy(notebook)
+    for cell in canonical.get("cells", []):
+        source = cell.get("source")
+        if isinstance(source, list):
+            cell["source"] = "".join(str(item) for item in source)
+    return canonical
+
+
+def notebook_has_effective_update(snapshot_path: Path, downloaded: dict[str, Any]) -> bool:
+    if not snapshot_path.is_file():
+        return True
+
+    try:
+        current = parse_notebook_json(snapshot_path.read_text(), str(snapshot_path))
+    except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return True
+
+    return canonical_notebook(current) != canonical_notebook(downloaded)
+
+
+def write_original_notebook_snapshot(
+    target: Target,
+    raw_text: str,
+    notebook: dict[str, Any],
+) -> str:
+    ORIGINAL_NOTEBOOK_DIR.mkdir(parents=True, exist_ok=True)
+    snapshot_path = ORIGINAL_NOTEBOOK_DIR / target.notebook
+    if not notebook_has_effective_update(snapshot_path, notebook):
+        return display_path(snapshot_path)
+
+    snapshot_path.write_text(raw_text)
+    print(
+        f"[native-sync] updated {display_path(snapshot_path)} from downloaded notebook",
+        flush=True,
+    )
+    return display_path(snapshot_path)
+
+
+def load_notebook(
+    target: Target,
+    mode: str,
+    sync_native_snapshot: bool = True,
+) -> tuple[dict[str, Any], dict[str, str | None]]:
     if mode == "native":
         errors: list[str] = []
         for url in native_notebook_urls(target.model_id):
             for attempt in range(1, 4):
                 try:
-                    return read_json_url(url), {
+                    raw_text = read_text_url(url)
+                    notebook = parse_notebook_json(raw_text, url)
+                    snapshot = (
+                        write_original_notebook_snapshot(target, raw_text, notebook)
+                        if sync_native_snapshot
+                        else display_path(ORIGINAL_NOTEBOOK_DIR / target.notebook)
+                    )
+                    return notebook, {
                         "source": f"{HF_CANONICAL}/{target.model_id}.ipynb",
                         "fetched_url": url,
+                        "snapshot": snapshot,
                     }
                 except (
                     OSError,
                     TimeoutError,
+                    ValueError,
                     urllib.error.URLError,
                     json.JSONDecodeError,
                     UnicodeDecodeError,
                 ) as exc:
                     errors.append(f"{url} attempt {attempt}: {type(exc).__name__}: {exc}")
                     time.sleep(min(attempt * 2, 5))
+
+        fallback_path = ORIGINAL_NOTEBOOK_DIR / target.notebook
+        if fallback_path.is_file():
+            try:
+                notebook = parse_notebook_json(fallback_path.read_text(), str(fallback_path))
+            except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+                errors.append(
+                    f"{display_path(fallback_path)} fallback: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            else:
+                print(
+                    f"[native-fallback] using {display_path(fallback_path)} after "
+                    "download failure",
+                    flush=True,
+                )
+                return notebook, {
+                    "source": display_path(fallback_path),
+                    "fetched_url": None,
+                    "snapshot": display_path(fallback_path),
+                }
+
         raise RuntimeError("could not download native notebook: " + " | ".join(errors))
 
     path = FIXED_NOTEBOOK_DIR / target.notebook
     if not path.is_file():
         raise FileNotFoundError(f"fixed notebook not found: {path}")
     return json.loads(path.read_text()), {
-        "source": str(path.relative_to(REPO)),
+        "source": display_path(path),
         "fetched_url": None,
     }
 
@@ -966,6 +1056,7 @@ def make_report(
         "artifact_notebook": artifact_name,
         "source": source_info.get("source"),
         "fetched_url": source_info.get("fetched_url"),
+        "snapshot": source_info.get("snapshot"),
         "overall_status": overall,
         "cells_passed": passed,
         "cells_failed": failed,
@@ -992,7 +1083,7 @@ def validate_plan(jobs: list[tuple[str, Target]]) -> list[str]:
     print(f"Plan contains {len(jobs)} notebook job(s).", flush=True)
     for mode, target in jobs:
         try:
-            notebook, source = load_notebook(target, mode)
+            notebook, source = load_notebook(target, mode, sync_native_snapshot=False)
             normalized = normalize_notebook(notebook, mode)
             code_cells = sum(
                 cell.get("cell_type") == "code"
