@@ -104,25 +104,10 @@ except Exception:
 print("[ci-normalize] GPU placement defaults applied")
 '''
 
-REMOTE_ONLY_RE = re.compile(
-    r"router\.huggingface\.co|from openai import|OpenAI\(|"
-    r"from google\.colab|InferenceClient"
-)
 REMOTE_INFERENCE_HEADING_RE = re.compile(
     r"(?im)^\s*##\s+Remote Inference via Inference Providers\b"
 )
 MARKDOWN_SECTION_HEADING_RE = re.compile(r"(?im)^\s*##\s+")
-LOGIN_CALL_RE = re.compile(r"\blogin\s*\(")
-ENV_ASSIGN_RE = re.compile(
-    r"""^\s*(?:os\.)?environ\s*\[\s*['"]"""
-    r"""(?:HF_TOKEN|HUGGING_FACE_HUB_TOKEN|HUGGINGFACEHUB_API_TOKEN|HF_ENDPOINT|"""
-    r"""HF_HUB_DISABLE_XET|HTTP_PROXY|"""
-    r"""HTTPS_PROXY|http_proxy|https_proxy)['"]\s*\]\s*="""
-)
-HF_TOKEN_PLACEHOLDER_RE = re.compile(
-    r"""(?m)^(\s*(?:os\.)?environ\s*\[\s*['"]HF_TOKEN['"]\s*\]\s*=\s*)"""
-    r"""['"]YOUR_TOKEN_HERE['"]\s*$"""
-)
 GRANITE_SAMPLE_RE = re.compile(
     r"""hf_hub_download\(\s*repo_id\s*=\s*model_path\s*,\s*"""
     r"""filename\s*=\s*['"]multilingual_sample\.wav['"]\s*\)"""
@@ -404,22 +389,6 @@ def assert_jpeg_support() -> None:
     )
 
 
-def comment_cell(source: str, reason: str) -> str:
-    return "\n".join(f"# [ci-skip {reason}] {line}" for line in source.splitlines())
-
-
-def protect_env_assignments(source: str) -> str:
-    lines = []
-    for line in source.splitlines():
-        if (
-            ENV_ASSIGN_RE.match(line)
-            and "[ci-injected-hf-token]" not in line
-        ):
-            line = "# [ci-protect env] " + line
-        lines.append(line)
-    return "\n".join(lines)
-
-
 def runtime_hf_token() -> str:
     for key in TOKEN_ENV_KEYS:
         token = LOADED_ENV.get(key) or os.environ.get(key, "")
@@ -427,16 +396,6 @@ def runtime_hf_token() -> str:
             SECRET_VALUES.add(token)
             return token
     return ""
-
-
-def should_skip_remote_or_auth(source: str) -> bool:
-    if REMOTE_ONLY_RE.search(source):
-        return True
-    if HF_TOKEN_PLACEHOLDER_RE.search(source):
-        return True
-    if "huggingface_hub import login" in source or LOGIN_CALL_RE.search(source):
-        return not bool(runtime_hf_token())
-    return False
 
 
 def remote_section_decision(cell: dict[str, Any], in_remote_section: bool) -> tuple[bool, bool]:
@@ -491,12 +450,8 @@ def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
             continue
 
         source = "".join(cell.get("source", []))
-        if should_skip_remote_or_auth(source):
-            source = comment_cell(source, "remote-or-auth")
-        else:
-            source = protect_env_assignments(source)
-            source = rewrite_source_data_urls(source)
-            source = rewrite_hf_urls_to_endpoint(source)
+        source = rewrite_source_data_urls(source)
+        source = rewrite_hf_urls_to_endpoint(source)
 
         clean_cell = dict(cell)
         metadata = dict(clean_cell.get("metadata") or {})
