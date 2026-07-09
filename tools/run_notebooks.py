@@ -435,7 +435,7 @@ def should_skip_remote_or_auth(source: str) -> bool:
     if HF_TOKEN_PLACEHOLDER_RE.search(source):
         return True
     if "huggingface_hub import login" in source or LOGIN_CALL_RE.search(source):
-        return True
+        return not bool(runtime_hf_token())
     return False
 
 

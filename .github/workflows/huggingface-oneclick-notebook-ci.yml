@@ -20,6 +20,7 @@ jobs:
     timeout-minutes: 2880
     env:
       CI_CONTAINER: hf-ci-oneclick-${{ github.run_id }}
+      HF_TOKEN_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260709-hf-token-env
 
     steps:
       - name: Checkout target revision
@@ -60,11 +61,16 @@ jobs:
       - name: Execute notebook CI
         env:
           INPUT_FILTER: ${{ github.event.inputs.filter }}
+          HF_ONECLICK_TOKEN: ${{ secrets.HF_ONECLICK_TOKEN }}
         run: |
           rm -rf results
           mkdir -p results
 
           FILTER="${INPUT_FILTER:-}"
+          if [ -z "${HF_ONECLICK_TOKEN:-}" ]; then
+            echo "::error::HF_ONECLICK_TOKEN secret is required for this token-enabled branch"
+            exit 1
+          fi
 
           SELECTED_RENDER_NODE="${{ steps.select_gpu.outputs.render_node }}"
           if [ -z "$SELECTED_RENDER_NODE" ]; then
@@ -88,6 +94,9 @@ jobs:
             -v "$PWD":/workspace -w /workspace \
             -e HF_ENDPOINT=http://134.199.133.77 \
             -e HF_HUB_DISABLE_XET=1 \
+            -e HF_TOKEN="$HF_ONECLICK_TOKEN" \
+            -e HUGGING_FACE_HUB_TOKEN="$HF_ONECLICK_TOKEN" \
+            -e HUGGINGFACEHUB_API_TOKEN="$HF_ONECLICK_TOKEN" \
             -e HF_HOME="$HF_CACHE_ROOT" \
             -e HF_HUB_CACHE="$HF_CACHE_ROOT/hub" \
             -e HF_DATASETS_CACHE="$HF_CACHE_ROOT/datasets" \
@@ -98,7 +107,7 @@ jobs:
             -e RADEON_CI_GPU_PCI_BUS="${{ steps.select_gpu.outputs.pci_bus }}" \
             -e PYTHONUNBUFFERED=1 \
             --entrypoint /bin/bash \
-            huaggingface_for_amd_radeon:latest \
+            "$HF_TOKEN_IMAGE" \
             -lc 'args=(
                   --results-dir results
                   --target-file doc/ci_target_models.csv
