@@ -267,6 +267,10 @@ def canonical_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
     return canonical
 
 
+def notebook_json_text(notebook: dict[str, Any]) -> str:
+    return json.dumps(notebook, indent=1, ensure_ascii=False) + "\n"
+
+
 def notebook_has_effective_update(snapshot_path: Path, downloaded: dict[str, Any]) -> bool:
     if not snapshot_path.is_file():
         return True
@@ -281,7 +285,6 @@ def notebook_has_effective_update(snapshot_path: Path, downloaded: dict[str, Any
 
 def write_original_notebook_snapshot(
     target: Target,
-    raw_text: str,
     notebook: dict[str, Any],
 ) -> str:
     ORIGINAL_NOTEBOOK_DIR.mkdir(parents=True, exist_ok=True)
@@ -289,12 +292,28 @@ def write_original_notebook_snapshot(
     if not notebook_has_effective_update(snapshot_path, notebook):
         return display_path(snapshot_path)
 
-    snapshot_path.write_text(raw_text)
+    snapshot_path.write_text(notebook_json_text(notebook))
     print(
         f"[oneclick-sync] updated {display_path(snapshot_path)} from downloaded notebook",
         flush=True,
     )
     return display_path(snapshot_path)
+
+
+def prune_original_notebook_snapshots(targets: list[Target]) -> None:
+    if not ORIGINAL_NOTEBOOK_DIR.is_dir():
+        return
+
+    expected = {target.notebook for target in targets}
+    for snapshot_path in sorted(ORIGINAL_NOTEBOOK_DIR.glob("*.ipynb")):
+        if snapshot_path.name in expected:
+            continue
+        snapshot_path.unlink()
+        print(
+            f"[oneclick-sync] removed {display_path(snapshot_path)}; "
+            "not listed in enabled targets",
+            flush=True,
+        )
 
 
 def load_notebook(
@@ -308,7 +327,7 @@ def load_notebook(
                 raw_text = read_text_url(url)
                 notebook = parse_notebook_json(raw_text, url)
                 snapshot = (
-                    write_original_notebook_snapshot(target, raw_text, notebook)
+                    write_original_notebook_snapshot(target, notebook)
                     if sync_native_snapshot
                     else display_path(ORIGINAL_NOTEBOOK_DIR / target.notebook)
                 )
@@ -1055,13 +1074,17 @@ def main() -> None:
     if not args.plan_only:
         assert_jpeg_support()
 
-    targets = load_targets(Path(args.target_file), args.filter)
+    target_file = Path(args.target_file)
+    all_targets = load_targets(target_file, "")
+    targets = load_targets(target_file, args.filter)
     if not targets:
         raise SystemExit(f"no enabled targets matched filter {args.filter!r}")
 
     if args.plan_only:
         errors = validate_plan(targets)
         raise SystemExit(1 if errors else 0)
+
+    prune_original_notebook_snapshots(all_targets)
 
     policy = (
         f"source=hf-oneclick; fail_on={args.fail_on}; "

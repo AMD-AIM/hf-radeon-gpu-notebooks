@@ -10,6 +10,9 @@ on:
   push:
     branches: [main, "ci/**"]
 
+permissions:
+  contents: write
+
 concurrency:
   group: huggingface-oneclick-ci
   cancel-in-progress: false
@@ -28,7 +31,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          persist-credentials: false
+          persist-credentials: true
           clean: false
           sparse-checkout: |
             .github
@@ -115,6 +118,32 @@ jobs:
                 )
                 if [ -n "$CI_FILTER" ]; then args+=(--filter "$CI_FILTER"); fi
                 python3 -u tools/run_notebooks.py "${args[@]}"'
+
+      - name: Sync downloaded notebook snapshots
+        if: always() && startsWith(github.ref, 'refs/heads/')
+        run: |
+          BRANCH="${GITHUB_REF_NAME}"
+          if [ -z "$BRANCH" ]; then
+            echo "No branch ref is available; skip original_notebooks sync."
+            exit 0
+          fi
+
+          if [ ! -d original_notebooks ]; then
+            echo "original_notebooks was not created; nothing to sync."
+            exit 0
+          fi
+
+          git add original_notebooks
+          if git diff --cached --quiet -- original_notebooks; then
+            echo "No downloaded notebook snapshot changes."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update original notebooks from Hugging Face [skip ci]"
+          git pull --rebase origin "$BRANCH"
+          git push origin "HEAD:$BRANCH"
 
       - name: Tear down CI container
         if: always()
