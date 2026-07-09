@@ -16,11 +16,11 @@ ibm-granite/granite-speech-4.1-2b,ibm-granite__granite-speech-4.1-2b.ipynb,yes
 baidu/Qianfan-OCR,baidu__Qianfan-OCR.ipynb,yes
 Qwen/Qwen3.5-0.8B,Qwen__Qwen3.5-0.8B.ipynb,yes
 zai-org/GLM-OCR,zai-org__GLM-OCR.ipynb,yes
-microsoft/VibeVoice-ASR,microsoft__VibeVoice-ASR.ipynb,yes
+google/gemma-3-270m,google__gemma-3-270m.ipynb,yes
 Qwen/Qwen3.5-2B,Qwen__Qwen3.5-2B.ipynb,yes
 microsoft/UserLM-8b,microsoft__UserLM-8b.ipynb,yes
 google/gemma-3-4b-it,google__gemma-3-4b-it.ipynb,yes
 google/gemma-3-1b-it,google__gemma-3-1b-it.ipynb,yes
-microsoft/VibeVoice-1.5B,microsoft__VibeVoice-1.5B.ipynb,yes
+Qwen/Qwen3-1.7B,Qwen__Qwen3-1.7B.ipynb,yes
 Qwen/Qwen3-14B,Qwen__Qwen3-14B.ipynb,yes
-openbmb/MiniCPM-o-4_5,openbmb__MiniCPM-o-4_5.ipynb,yes
+Qwen/Qwen3-VL-4B-Instruct,Qwen__Qwen3-VL-4B-Instruct.ipynb,yes
