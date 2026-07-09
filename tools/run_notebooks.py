@@ -105,6 +105,9 @@ except Exception:
 print("[ci-normalize] GPU placement defaults applied")
 '''
 
+PIP_INSTALL_RE = re.compile(
+    r"(?is)(?:^|\b|[%!])(?:python3?\s+-m\s+)?pip\s+install\b|['\"]pip\s+install\b"
+)
 REMOTE_ONLY_RE = re.compile(
     r"router\.huggingface\.co|from openai import|OpenAI\(|"
     r"from google\.colab|InferenceClient"
@@ -520,6 +523,8 @@ def normalize_notebook(
 
         if should_skip_remote_or_auth(source):
             source = comment_cell(source, "remote-or-auth")
+        elif mode == "fixed" and PIP_INSTALL_RE.search(source):
+            source = comment_cell(source, "pip-cell")
         else:
             source = protect_env_assignments(source)
             source = rewrite_source_data_urls(source)
@@ -1153,8 +1158,8 @@ def main() -> None:
         phases = [("Radeon fixed notebooks", fixed_jobs)]
     else:
         phases = [
-            ("HF native notebooks", native_jobs),
             ("Radeon fixed notebooks", fixed_jobs),
+            ("HF native notebooks", native_jobs),
         ]
 
     policy = (
