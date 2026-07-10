@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 2880
     env:
       CI_CONTAINER: hf-ci-oneclick-${{ github.run_id }}
-      HF_TOKEN_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260710-hf-mitmproxy-multimirror-force-local
+      HF_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260710-hf-mitmproxy-multimirror-force-local
 
     steps:
       - name: Checkout target revision
@@ -108,7 +108,7 @@ jobs:
             -e RADEON_CI_GPU_PCI_BUS="${{ steps.select_gpu.outputs.pci_bus }}" \
             -e PYTHONUNBUFFERED=1 \
             --entrypoint /bin/bash \
-            "$HF_TOKEN_IMAGE" \
+            "$HF_CI_IMAGE" \
             -lc 'args=(
                   --results-dir results
                   --target-file doc/ci_target_models.csv
