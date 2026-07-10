@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 2880
     env:
       CI_CONTAINER: hf-ci-oneclick-${{ github.run_id }}
-      HF_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260711_workaround
+      HF_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260711_workaround_fix_torch
 
     steps:
       - name: Checkout target revision
