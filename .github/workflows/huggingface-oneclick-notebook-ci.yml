@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 2880
     env:
       CI_CONTAINER: hf-ci-oneclick-${{ github.run_id }}
-      HF_TOKEN_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260709-hf-token-env
+      HF_TOKEN_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260707
 
     steps:
       - name: Checkout target revision
