@@ -26,9 +26,6 @@ TARGET_CSV = REPO / "doc" / "ci_target_models.csv"
 ORIGINAL_NOTEBOOK_DIR = REPO / "original_notebooks"
 SOURCE_DATA_DIR = REPO / "source_data"
 SOURCE_MAP_JSON = SOURCE_DATA_DIR / "resource_map.json"
-DEFAULT_ENV_FILE = os.environ.get(
-    "RADEON_CI_ENV_FILE", "/disk/ssd1/zihaomu_amd/ci_secrets.env"
-)
 HF_CANONICAL = "https://huggingface.co"
 VRAM_BUDGET_GB = float(os.environ.get("RADEON_CI_VRAM_PER_GPU_GB", "48"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -1060,7 +1057,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--env-file",
         default="",
-        help=f"optional KEY=VALUE env file for HF_TOKEN/proxy settings; default {DEFAULT_ENV_FILE}",
+        help="optional KEY=VALUE env file for local manual runs; no env file is loaded by default",
     )
     return parser.parse_args()
 
@@ -1070,7 +1067,8 @@ def main() -> None:
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
 
-    load_env_file(args.env_file or DEFAULT_ENV_FILE)
+    if args.env_file:
+        load_env_file(args.env_file)
     if not args.plan_only:
         assert_jpeg_support()
 

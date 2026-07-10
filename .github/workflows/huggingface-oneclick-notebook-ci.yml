@@ -92,7 +92,6 @@ jobs:
             --group-add 44 --group-add 993 \
             --security-opt seccomp=unconfined \
             --ipc=host --shm-size 32g \
-            -v /disk/ssd1:/disk/ssd1 \
             -v /disk/ssd2:/disk/ssd2 \
             -v "$PWD":/workspace -w /workspace \
             -e HF_ENDPOINT=http://134.199.133.77 \
