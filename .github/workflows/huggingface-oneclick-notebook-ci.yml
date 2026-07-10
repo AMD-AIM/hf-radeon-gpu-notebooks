@@ -141,8 +141,27 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -m "Update original notebooks from Hugging Face [skip ci]"
-          git pull --rebase origin "$BRANCH"
-          git push origin "HEAD:$BRANCH"
+
+          retry_git() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if "$@"; then
+                return 0
+              fi
+              echo "::warning::git command failed on attempt ${attempt}/5: $*"
+              sleep $((attempt * 20))
+            done
+            return 1
+          }
+
+          if ! retry_git git pull --rebase origin "$BRANCH"; then
+            echo "::warning::Could not rebase downloaded notebook snapshot update; leaving CI result unchanged."
+            exit 0
+          fi
+          if ! retry_git git push origin "HEAD:$BRANCH"; then
+            echo "::warning::Could not push downloaded notebook snapshot update; leaving CI result unchanged."
+            exit 0
+          fi
 
       - name: Tear down CI container
         if: always()
