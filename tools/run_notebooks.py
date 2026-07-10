@@ -31,6 +31,7 @@ VRAM_BUDGET_GB = float(os.environ.get("RADEON_CI_VRAM_PER_GPU_GB", "48"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SECRET_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 TOKEN_ENV_KEYS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN")
+DISABLED_TARGET_VALUES = {"0", "false", "no", "n"}
 LOADED_ENV: dict[str, str] = {}
 SECRET_VALUES: set[str] = set()
 
@@ -193,13 +194,17 @@ def load_env_file(path: str) -> None:
     print(f"[env] loaded {len(loaded)} var(s) from {env_path}: {shown}", flush=True)
 
 
-def load_targets(path: Path, text_filter: str = "") -> list[Target]:
+def load_targets(
+    path: Path,
+    text_filter: str = "",
+    include_disabled: bool = False,
+) -> list[Target]:
     targets: list[Target] = []
     needle = text_filter.lower().strip()
     with path.open(newline="") as f:
         for index, row in enumerate(csv.DictReader(f), 2):
             enabled = (row.get("enabled") or "yes").strip().lower()
-            if enabled in {"0", "false", "no", "n"}:
+            if enabled in DISABLED_TARGET_VALUES and not include_disabled:
                 continue
 
             model_id = (row.get("model_id") or "").strip()
@@ -255,15 +260,6 @@ def display_path(path: Path) -> str:
         return str(path)
 
 
-def canonical_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
-    canonical = copy.deepcopy(notebook)
-    for cell in canonical.get("cells", []):
-        source = cell.get("source")
-        if isinstance(source, list):
-            cell["source"] = "".join(str(item) for item in source)
-    return canonical
-
-
 def notebook_json_text(notebook: dict[str, Any]) -> str:
     return json.dumps(notebook, indent=1, ensure_ascii=False) + "\n"
 
@@ -277,7 +273,7 @@ def notebook_has_effective_update(snapshot_path: Path, downloaded: dict[str, Any
     except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
         return True
 
-    return canonical_notebook(current) != canonical_notebook(downloaded)
+    return current != downloaded
 
 
 def write_original_notebook_snapshot(
@@ -311,6 +307,24 @@ def prune_original_notebook_snapshots(targets: list[Target]) -> None:
             "not listed in enabled targets",
             flush=True,
         )
+
+
+def sync_original_notebook_snapshots(
+    targets: list[Target],
+    synced_notebooks: set[str] | None = None,
+) -> None:
+    synced = synced_notebooks or set()
+    for target in targets:
+        if target.notebook in synced:
+            continue
+        try:
+            load_notebook(target, sync_native_snapshot=True)
+        except Exception as exc:
+            print(
+                f"[oneclick-sync] could not update {target.notebook}: "
+                f"{compact_error(f'{type(exc).__name__}: {exc}', 240)}",
+                flush=True,
+            )
 
 
 def load_notebook(
@@ -1073,7 +1087,7 @@ def main() -> None:
         assert_jpeg_support()
 
     target_file = Path(args.target_file)
-    all_targets = load_targets(target_file, "")
+    snapshot_targets = load_targets(target_file, "", include_disabled=True)
     targets = load_targets(target_file, args.filter)
     if not targets:
         raise SystemExit(f"no enabled targets matched filter {args.filter!r}")
@@ -1082,13 +1096,14 @@ def main() -> None:
         errors = validate_plan(targets)
         raise SystemExit(1 if errors else 0)
 
-    prune_original_notebook_snapshots(all_targets)
+    prune_original_notebook_snapshots(snapshot_targets)
 
     policy = (
         f"source=hf-oneclick; fail_on={args.fail_on}; "
         "single Radeon GPU; model ids load through mounted Hugging Face cache"
     )
     reports: list[dict[str, Any]] = []
+    synced_notebooks: set[str] = set()
     pending = [f"oneclick__{target.notebook}" for target in targets]
     write_progress(results_dir, reports, pending)
 
@@ -1106,10 +1121,13 @@ def main() -> None:
         print(f"==> START {run_name} ({target.model_id})", flush=True)
         write_progress(results_dir, reports, pending, running=run_name)
         report = run_one(target, args, results_dir)
+        if report.get("fetched_url"):
+            synced_notebooks.add(target.notebook)
         reports.append(report)
         write_summary(results_dir, reports, policy)
         write_progress(results_dir, reports, pending)
 
+    sync_original_notebook_snapshots(snapshot_targets, synced_notebooks)
     write_summary(results_dir, reports, policy)
 
     if args.fail_on == "none":
