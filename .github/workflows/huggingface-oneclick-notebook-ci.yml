@@ -23,7 +23,7 @@ jobs:
     timeout-minutes: 2880
     env:
       CI_CONTAINER: hf-ci-oneclick-${{ github.run_id }}
-      HF_TOKEN_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260707
+      HF_TOKEN_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260710-hf-mitmproxy-workaround
 
     steps:
       - name: Checkout target revision
@@ -37,7 +37,6 @@ jobs:
             .github
             doc
             original_notebooks
-            source_data
             tools
           sparse-checkout-cone-mode: true
 

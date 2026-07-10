@@ -24,8 +24,6 @@ from typing import Any
 REPO = Path(__file__).resolve().parents[1]
 TARGET_CSV = REPO / "doc" / "ci_target_models.csv"
 ORIGINAL_NOTEBOOK_DIR = REPO / "original_notebooks"
-SOURCE_DATA_DIR = REPO / "source_data"
-SOURCE_MAP_JSON = SOURCE_DATA_DIR / "resource_map.json"
 HF_CANONICAL = "https://huggingface.co"
 VRAM_BUDGET_GB = float(os.environ.get("RADEON_CI_VRAM_PER_GPU_GB", "48"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -38,8 +36,6 @@ SECRET_VALUES: set[str] = set()
 
 GPU_PREAMBLE = '''# [ci-normalize] prefer GPU placement for HF helpers.
 import functools as _ci_functools
-import os as _ci_os
-import urllib.request as _ci_urllib_request
 import transformers as _ci_transformers
 
 _ci_original_pipeline = _ci_transformers.pipeline
@@ -71,34 +67,6 @@ for _ci_name in (
         return _ci_from_pretrained
     _ci_cls.from_pretrained = _ci_make_from_pretrained(_ci_original)
 
-_ci_original_urlopen = _ci_urllib_request.urlopen
-def _ci_urlopen(url, *args, **kwargs):
-    candidate = getattr(url, "full_url", url)
-    if isinstance(candidate, str) and _ci_os.path.isfile(candidate):
-        return open(candidate, "rb")
-    return _ci_original_urlopen(url, *args, **kwargs)
-_ci_urllib_request.urlopen = _ci_urlopen
-
-try:
-    import requests as _ci_requests
-    _ci_original_requests_get = _ci_requests.get
-    class _ci_local_file_response:
-        def __init__(self, path):
-            self.path = path
-            self.status_code = 200
-            self.ok = True
-            with open(path, "rb") as _ci_f:
-                self.content = _ci_f.read()
-        def raise_for_status(self):
-            return None
-    def _ci_requests_get(url, *args, **kwargs):
-        if isinstance(url, str) and _ci_os.path.isfile(url):
-            return _ci_local_file_response(url)
-        return _ci_original_requests_get(url, *args, **kwargs)
-    _ci_requests.get = _ci_requests_get
-except Exception:
-    pass
-
 print("[ci-normalize] GPU placement defaults applied")
 '''
 
@@ -106,10 +74,6 @@ REMOTE_INFERENCE_HEADING_RE = re.compile(
     r"(?im)^\s*##\s+Remote Inference via Inference Providers\b"
 )
 MARKDOWN_SECTION_HEADING_RE = re.compile(r"(?im)^\s*##\s+")
-GRANITE_SAMPLE_RE = re.compile(
-    r"""hf_hub_download\(\s*repo_id\s*=\s*model_path\s*,\s*"""
-    r"""filename\s*=\s*['"]multilingual_sample\.wav['"]\s*\)"""
-)
 
 
 @dataclass(frozen=True)
@@ -124,28 +88,6 @@ def utc_now() -> str:
 
 RUN_STARTED_AT = time.time()
 RUN_STARTED_UTC = utc_now()
-
-
-def load_source_data_rewrites() -> dict[str, str]:
-    if not SOURCE_MAP_JSON.is_file():
-        return {}
-    try:
-        raw_map = json.loads(SOURCE_MAP_JSON.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        print(f"[source-data] could not load {SOURCE_MAP_JSON}: {exc}", flush=True)
-        return {}
-
-    rewrites: dict[str, str] = {}
-    for url, filename in raw_map.items():
-        local_path = SOURCE_DATA_DIR / str(filename)
-        if local_path.is_file():
-            rewrites[str(url)] = str(local_path.resolve())
-        else:
-            print(f"[source-data] missing local asset for {url}: {local_path}", flush=True)
-    return rewrites
-
-
-SOURCE_DATA_REWRITES = load_source_data_rewrites()
 
 
 def mask_env(name: str, value: str) -> str:
@@ -440,23 +382,6 @@ def remote_section_decision(cell: dict[str, Any], in_remote_section: bool) -> tu
     return in_remote_section, in_remote_section
 
 
-def rewrite_hf_urls_to_endpoint(source: str) -> str:
-    endpoint = os.environ.get("HF_ENDPOINT", "").strip().rstrip("/")
-    if not endpoint:
-        return source
-    return source.replace(HF_CANONICAL, endpoint)
-
-
-def rewrite_source_data_urls(source: str) -> str:
-    for url, local_path in SOURCE_DATA_REWRITES.items():
-        source = source.replace(url, local_path)
-
-    granite_sample = SOURCE_DATA_DIR / "multilingual_sample.wav"
-    if granite_sample.is_file():
-        source = GRANITE_SAMPLE_RE.sub(repr(str(granite_sample.resolve())), source)
-    return source
-
-
 def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(notebook)
     in_remote_section = False
@@ -480,8 +405,6 @@ def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
             continue
 
         source = "".join(cell.get("source", []))
-        source = rewrite_source_data_urls(source)
-        source = rewrite_hf_urls_to_endpoint(source)
 
         clean_cell = dict(cell)
         metadata = dict(clean_cell.get("metadata") or {})
