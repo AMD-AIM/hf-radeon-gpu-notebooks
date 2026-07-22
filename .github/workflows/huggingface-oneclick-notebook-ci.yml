@@ -1,4 +1,5 @@
-name: huggingface-oneclick-notebook-ci
+name: Hugging Face One-Click Notebook CI
+run-name: "[Run] Workaround CI"
 
 on:
   workflow_dispatch:
