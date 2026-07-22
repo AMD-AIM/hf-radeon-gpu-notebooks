@@ -18,7 +18,7 @@ import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -30,6 +30,8 @@ ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SECRET_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
 TOKEN_ENV_KEYS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "HUGGINGFACEHUB_API_TOKEN")
 DISABLED_TARGET_VALUES = {"0", "false", "no", "n"}
+MODEL_DOWNLOAD_ATTEMPTS = 3
+MODEL_DOWNLOAD_RETRY_DELAY_SECONDS = 5
 LOADED_ENV: dict[str, str] = {}
 SECRET_VALUES: set[str] = set()
 
@@ -134,6 +136,42 @@ def load_env_file(path: str) -> None:
 
     shown = ", ".join(f"{k}={mask_env(k, v)}" for k, v in sorted(loaded.items()))
     print(f"[env] loaded {len(loaded)} var(s) from {env_path}: {shown}", flush=True)
+
+
+def resolved_hf_hub_cache() -> Path:
+    configured = os.environ.get("HF_HUB_CACHE", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+
+    hf_home = os.environ.get("HF_HOME", "").strip()
+    if hf_home:
+        return (Path(hf_home).expanduser() / "hub").resolve()
+
+    xdg_cache = os.environ.get("XDG_CACHE_HOME", "").strip()
+    cache_home = Path(xdg_cache).expanduser() if xdg_cache else Path.home() / ".cache"
+    return (cache_home / "huggingface" / "hub").resolve()
+
+
+def assert_shared_model_cache() -> Path:
+    hub_cache = resolved_hf_hub_cache()
+    transformers_cache = os.environ.get("TRANSFORMERS_CACHE", "").strip()
+    if transformers_cache:
+        resolved_transformers_cache = Path(transformers_cache).expanduser().resolve()
+        if resolved_transformers_cache != hub_cache:
+            raise RuntimeError(
+                "hf download and Transformers must share one cache: "
+                f"HF_HUB_CACHE={hub_cache}, "
+                f"TRANSFORMERS_CACHE={resolved_transformers_cache}"
+            )
+
+    print(
+        "[cache] shared model cache "
+        f"HF_HOME={os.environ.get('HF_HOME', '') or '(default)'} "
+        f"HF_HUB_CACHE={hub_cache} "
+        f"TRANSFORMERS_CACHE={transformers_cache or '(inherits Hub cache)'}",
+        flush=True,
+    )
+    return hub_cache
 
 
 def load_targets(
@@ -545,6 +583,65 @@ def save_json(path: Path, data: Any) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
 
 
+def download_model(
+    model_id: str,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    command = ["hf", "download", model_id]
+    last_error = ""
+
+    def announce(message: str) -> None:
+        print(message, flush=True)
+        if log is not None:
+            log(message)
+
+    for attempt in range(1, MODEL_DOWNLOAD_ATTEMPTS + 1):
+        announce(
+            f"[MODEL-DOWNLOAD] attempt {attempt}/{MODEL_DOWNLOAD_ATTEMPTS}: "
+            f"hf download {model_id}"
+        )
+        try:
+            result = subprocess.run(command, check=False)
+        except OSError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+        else:
+            if result.returncode == 0:
+                elapsed = round(time.monotonic() - started, 1)
+                announce(
+                    f"[MODEL-DOWNLOAD] success after {attempt} attempt(s) "
+                    f"in {elapsed}s: {model_id}"
+                )
+                return {
+                    "status": "PASSED",
+                    "attempts": attempt,
+                    "elapsed_seconds": elapsed,
+                    "cache_path": str(resolved_hf_hub_cache()),
+                    "error": None,
+                }
+            last_error = f"hf download exited with code {result.returncode}"
+
+        announce(
+            f"[MODEL-DOWNLOAD] failed attempt {attempt}/{MODEL_DOWNLOAD_ATTEMPTS}: "
+            f"{last_error}"
+        )
+        if attempt < MODEL_DOWNLOAD_ATTEMPTS:
+            time.sleep(MODEL_DOWNLOAD_RETRY_DELAY_SECONDS)
+
+    elapsed = round(time.monotonic() - started, 1)
+    announce(
+        f"[MODEL-DOWNLOAD] exhausted {MODEL_DOWNLOAD_ATTEMPTS} attempts "
+        f"in {elapsed}s: {model_id}"
+    )
+    return {
+        "status": "FAILED",
+        "attempts": MODEL_DOWNLOAD_ATTEMPTS,
+        "elapsed_seconds": elapsed,
+        "cache_path": str(resolved_hf_hub_cache()),
+        "error": last_error,
+    }
+
+
 def write_progress(
     results_dir: Path,
     reports: list[dict[str, Any]],
@@ -567,16 +664,19 @@ def write_progress(
 
     if reports:
         lines += [
-            "| # | Mode | Status | Model | Peak VRAM | GPU util avg/peak | Time | Log |",
-            "|--:|:----:|:------:|:------|:---------:|:-----------------:|-----:|:----|",
+            "| # | Mode | Status | Model | Download | Peak VRAM | GPU util avg/peak | Total | Log |",
+            "|--:|:----:|:------:|:------|---------:|:---------:|:-----------------:|------:|:----|",
         ]
         for index, report in enumerate(reports, 1):
             lines.append(
                 f"| {index} | {report['mode']} | {report['overall_status']} | "
-                f"`{report['model_id']}` | {report['vram_peak_gb']} GB | "
+                f"`{report['model_id']}` | "
+                f"{format_duration(report.get('download_elapsed_seconds'))} "
+                f"({report.get('download_attempts', 0)}x) | "
+                f"{report['vram_peak_gb']} GB | "
                 f"{format_pct(report.get('gpu_util_avg_pct'))}/"
                 f"{format_pct(report.get('gpu_util_peak_pct'))} | "
-                f"{report['elapsed_seconds']:.0f}s | {report['log_file']} |"
+                f"{format_duration(report['elapsed_seconds'])} | {report['log_file']} |"
             )
 
     if pending:
@@ -619,7 +719,7 @@ def write_summary(
         "",
         f"**{total} notebook jobs · {passed} PASS · {failed} FAIL · {errored} ERROR · "
         f"{rate:.1f}% pass · CI wall time {format_duration(wall_elapsed)} · "
-        f"notebook time {format_duration(total_elapsed)}**",
+        f"model job time {format_duration(total_elapsed)}**",
         "",
         f"Started: {RUN_STARTED_UTC}",
         f"Generated: {utc_now()}",
@@ -631,7 +731,7 @@ def write_summary(
         "| Scope | Jobs | Total Time | Avg / Job | Fastest | Slowest |",
         "|:------|-----:|-----------:|----------:|--------:|--------:|",
         timing_row("All", reports),
-        timing_row("HF Oneclick Notebooks", reports),
+        timing_row("HF Oneclick Model Jobs", reports),
     ]
 
     if reports:
@@ -644,8 +744,8 @@ def write_summary(
             f"{sum(r['overall_status'] == 'FAILED' for r in reports)} FAIL / "
             f"{sum(r['overall_status'] == 'ERROR' for r in reports)} ERROR**",
             "",
-            "| # | Status | Model | Cells P/F/T | Peak VRAM | GPU util avg/peak | Time | Core error |",
-            "|--:|:------:|:------|:-----------:|:---------:|:-----------------:|-----:|:-----------|",
+            "| # | Status | Model | Download | Cells P/F/T | Peak VRAM | GPU util avg/peak | Total | Core error |",
+            "|--:|:------:|:------|---------:|:-----------:|:---------:|:-----------------:|------:|:-----------|",
         ]
         for index, report in enumerate(reports, 1):
             peak = report["vram_peak_gb"]
@@ -653,6 +753,8 @@ def write_summary(
             lines.append(
                 f"| {index} | {icon[report['overall_status']]} | "
                 f"`{report['model_id']}` | "
+                f"{format_duration(report.get('download_elapsed_seconds'))} "
+                f"({report.get('download_attempts', 0)}x) | "
                 f"{report['cells_passed']}/{report['cells_failed']}/{report['cells_total']} | "
                 f"{vram} | "
                 f"{format_pct(report.get('gpu_util_avg_pct'))}/"
@@ -724,26 +826,79 @@ def run_one(
             print(line, flush=True)
 
     with log_path.open("w", buffering=1) as log:
-        started = time.time()
+        preparation_started = time.monotonic()
         source_info: dict[str, str | None] = {"source": None, "fetched_url": None}
+        emit(log, f"# {artifact_name} ({target.model_id}) mode={mode}")
+        emit(log, f"# notebook_preparation_started {utc_now()}")
+
         try:
             original, source_info = load_notebook(target)
             normalized = normalize_notebook(original)
             notebook = nbformat.from_dict(normalized)
         except Exception as exc:
+            preparation_elapsed = round(time.monotonic() - preparation_started, 3)
             error = f"{type(exc).__name__}: {exc}"
-            emit(log, f"# {artifact_name} ({target.model_id}) mode={mode}")
-            emit(log, f"# started {utc_now()}")
+            emit(log, f"# notebook_preparation={preparation_elapsed}s (excluded)")
             emit(log, f"[SOURCE-ERROR] {error}")
-            print(f"[SOURCE-ERROR] {mode} {target.model_id}: {compact_error(error, 300)}", flush=True)
-            report = make_report(target, mode, artifact_name, source_info, 0.0, {}, error, [])
+            print(
+                f"[SOURCE-ERROR] {mode} {target.model_id}: "
+                f"{compact_error(error, 300)}",
+                flush=True,
+            )
+            report = make_report(
+                target,
+                mode,
+                artifact_name,
+                source_info,
+                0.0,
+                {},
+                error,
+                [],
+                notebook_preparation_elapsed=preparation_elapsed,
+            )
             save_json(results_dir / artifact_name.replace(".ipynb", ".json"), report)
             return report
 
-        emit(log, f"# {artifact_name} ({target.model_id}) mode={mode}")
-        emit(log, f"# started {utc_now()}")
+        preparation_elapsed = round(time.monotonic() - preparation_started, 3)
         emit(log, f"# source={source_info.get('source')}")
         emit(log, f"# fetched_url={source_info.get('fetched_url')}")
+        emit(log, f"# notebook_preparation={preparation_elapsed}s (excluded)")
+
+        started = time.monotonic()
+        started_at = utc_now()
+        emit(log, f"# timed_model_job_started {started_at}")
+        emit(log, f"# model_cache={resolved_hf_hub_cache()}")
+
+        download = download_model(target.model_id, log=lambda line: emit(log, line))
+        if download["status"] != "PASSED":
+            elapsed = round(time.monotonic() - started, 1)
+            error = (
+                f"model download failed after {download['attempts']} attempts: "
+                f"{download.get('error') or 'unknown error'}"
+            )
+            emit(log, f"[MODEL-DOWNLOAD-ERROR] {error}")
+            print(
+                f"[MODEL-DOWNLOAD-ERROR] {mode} {target.model_id}: "
+                f"{compact_error(error, 300)}",
+                flush=True,
+            )
+            report = make_report(
+                target,
+                mode,
+                artifact_name,
+                source_info,
+                elapsed,
+                {},
+                error,
+                [],
+                download=download,
+                notebook_elapsed=0.0,
+                notebook_preparation_elapsed=preparation_elapsed,
+                started_at=started_at,
+            )
+            save_json(results_dir / artifact_name.replace(".ipynb", ".json"), report)
+            return report
+
         emit(log, "# visible_gpus=0\n")
 
         def on_cell_start(cell: dict[str, Any], cell_index: int, **_: Any) -> None:
@@ -803,6 +958,7 @@ def run_one(
                 exec_error["message"] = f"{type(exc).__name__}: {exc}"
 
         worker = threading.Thread(target=execute, daemon=True)
+        notebook_started = time.monotonic()
         worker.start()
         worker.join(args.notebook_timeout)
         if worker.is_alive():
@@ -818,7 +974,8 @@ def run_one(
             run_error = exec_error["message"]
             emit(log, f"[KERNEL-ERROR] {run_error}", True)
 
-        elapsed = round(time.time() - started, 1)
+        notebook_elapsed = round(time.monotonic() - notebook_started, 1)
+        elapsed = round(time.monotonic() - started, 1)
         stop.set()
         poller.join(timeout=5)
         for key, old_value in saved_gpu_env.items():
@@ -841,7 +998,9 @@ def run_one(
 
         emit(
             log,
-            f"\n# RESULT {overall} passed={passed} failed={failed} elapsed={elapsed}s "
+            f"\n# RESULT {overall} passed={passed} failed={failed} "
+            f"download={download['elapsed_seconds']}s/{download['attempts']}x "
+            f"notebook={notebook_elapsed}s total={elapsed}s "
             f"peak_vram={vram_peak}GB gpu_util_avg={format_pct(gpu_avg)} "
             f"gpu_util_peak={format_pct(gpu_peak)}",
         )
@@ -861,6 +1020,10 @@ def run_one(
         run_error,
         cells,
         overall=overall,
+        download=download,
+        notebook_elapsed=notebook_elapsed,
+        notebook_preparation_elapsed=preparation_elapsed,
+        started_at=started_at,
     )
     save_json(results_dir / artifact_name.replace(".ipynb", ".json"), report)
 
@@ -876,7 +1039,9 @@ def run_one(
     print(
         f"[{overall:6}] {mode:6} {target.notebook:45} "
         f"cells {passed}/{passed + failed}  {vram_peak:>5} GB  "
-        f"gpu {format_pct(gpu_avg)}/{format_pct(gpu_peak)}  {elapsed:>6}s",
+        f"gpu {format_pct(gpu_avg)}/{format_pct(gpu_peak)}  "
+        f"download {download['elapsed_seconds']}s/{download['attempts']}x  "
+        f"total {elapsed:>6}s",
         flush=True,
     )
     return report
@@ -916,7 +1081,12 @@ def make_report(
     run_error: str | None,
     cells: list[dict[str, Any]],
     overall: str | None = None,
+    download: dict[str, Any] | None = None,
+    notebook_elapsed: float = 0.0,
+    notebook_preparation_elapsed: float = 0.0,
+    started_at: str | None = None,
 ) -> dict[str, Any]:
+    download = download or {}
     passed = sum(cell["status"] == "PASSED" for cell in cells)
     failed = sum(cell["status"] == "FAILED" for cell in cells)
     if overall is None:
@@ -933,6 +1103,13 @@ def make_report(
         "cells_passed": passed,
         "cells_failed": failed,
         "cells_total": passed + failed,
+        "download_status": download.get("status"),
+        "download_attempts": download.get("attempts", 0),
+        "download_elapsed_seconds": download.get("elapsed_seconds", 0.0),
+        "download_cache_path": download.get("cache_path"),
+        "download_error": download.get("error"),
+        "notebook_preparation_elapsed_seconds": notebook_preparation_elapsed,
+        "notebook_elapsed_seconds": notebook_elapsed,
         "elapsed_seconds": elapsed,
         "vram_peak_gb": gpu.get("vram_peak_gb", 0.0),
         "gpu_util_avg_pct": gpu.get("gpu_util_avg_pct"),
@@ -942,6 +1119,7 @@ def make_report(
         "log_file": artifact_name.replace(".ipynb", ".log"),
         "run_error": run_error,
         "cells": cells,
+        "started_at": started_at,
         "finished_at": utc_now(),
     }
 
@@ -1006,7 +1184,9 @@ def main() -> None:
 
     if args.env_file:
         load_env_file(args.env_file)
+    model_cache: Path | None = None
     if not args.plan_only:
+        model_cache = assert_shared_model_cache()
         assert_jpeg_support()
 
     target_file = Path(args.target_file)
@@ -1023,7 +1203,10 @@ def main() -> None:
 
     policy = (
         f"source=hf-oneclick; fail_on={args.fail_on}; "
-        "single Radeon GPU; model ids load through mounted Hugging Face cache"
+        f"model_download='hf download MODEL_ID'; retries={MODEL_DOWNLOAD_ATTEMPTS}; "
+        f"model_cache={model_cache}; timing=download-start-to-nbclient-end; "
+        "notebook-preparation=excluded; "
+        "single Radeon GPU"
     )
     reports: list[dict[str, Any]] = []
     synced_notebooks: set[str] = set()
@@ -1036,12 +1219,16 @@ def main() -> None:
         flush=True,
     )
 
-    print(f"\n==> PHASE HF Oneclick notebooks: {len(targets)} job(s)", flush=True)
+    print(f"\n==> PHASE HF Oneclick model jobs: {len(targets)} job(s)", flush=True)
     for target in targets:
         run_name = f"oneclick__{target.notebook}"
         if run_name in pending:
             pending.remove(run_name)
-        print(f"==> START {run_name} ({target.model_id})", flush=True)
+        print(
+            f"==> START {run_name} ({target.model_id}): "
+            "prepare (excluded) -> download -> notebook",
+            flush=True,
+        )
         write_progress(results_dir, reports, pending, running=run_name)
         report = run_one(target, args, results_dir)
         if report.get("fetched_url"):

@@ -93,11 +93,11 @@ jobs:
             true|1|yes|y)
               HF_CACHE_MODE="runner"
               HF_CACHE_ROOT=/disk/ssd2/huggingface_cache
-              mkdir -p "$HF_CACHE_ROOT/hub" "$HF_CACHE_ROOT/datasets" "$HF_CACHE_ROOT/transformers"
+              mkdir -p "$HF_CACHE_ROOT/hub" "$HF_CACHE_ROOT/datasets"
               ;;
             false|0|no|n)
               HF_CACHE_MODE="container"
-              HF_CACHE_ROOT=/tmp/huggingface_cache
+              HF_CACHE_ROOT="/tmp/huggingface_cache/${{ github.run_id }}-${{ github.run_attempt }}"
               ;;
             *)
               echo "::error::use_runner_hf_cache must be true or false, got: $USE_RUNNER_HF_CACHE"
@@ -124,7 +124,7 @@ jobs:
             -e HF_HOME="$HF_CACHE_ROOT" \
             -e HF_HUB_CACHE="$HF_CACHE_ROOT/hub" \
             -e HF_DATASETS_CACHE="$HF_CACHE_ROOT/datasets" \
-            -e TRANSFORMERS_CACHE="$HF_CACHE_ROOT/transformers" \
+            -e TRANSFORMERS_CACHE="$HF_CACHE_ROOT/hub" \
             -e HF_CACHE_MODE="$HF_CACHE_MODE" \
             -e CI_FILTER="$FILTER" \
             -e RADEON_CI_RENDER_NODE="$SELECTED_RENDER_NODE" \
