@@ -16,8 +16,8 @@ on:
           - "false"
           - "true"
   schedule:
-    # Run daily at 06:00 and 18:00 Beijing time.
-    - cron: "0 6,18 * * *"
+    # Run daily at 06:05 and 18:05 Beijing time, avoiding top-of-hour load.
+    - cron: "5 6,18 * * *"
       timezone: "Asia/Shanghai"
 
 permissions:
