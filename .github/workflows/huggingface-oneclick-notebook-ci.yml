@@ -1,0 +1,44 @@
+name: schedule-huggingface-oneclick-workaround
+
+on:
+  workflow_dispatch:
+    inputs:
+      filter:
+        description: "Forwarded substring filter (blank = all)"
+        required: false
+        default: ""
+      use_runner_hf_cache:
+        description: "Forwarded cache mode; the scheduler always dispatches false"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+  schedule:
+    # GitHub cron uses UTC: 02:00/14:00 = 10:00/22:00 in Beijing (UTC+8).
+    - cron: "0 2,14 * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: schedule-huggingface-oneclick-workaround
+  cancel-in-progress: false
+
+jobs:
+  dispatch-workaround:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch cold-cache workaround CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_REF: ci/huggingface_oneclick_workaround
+          TARGET_WORKFLOW: huggingface-oneclick-notebook-ci.yml
+        run: |
+          gh workflow run "$TARGET_WORKFLOW" \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref "$TARGET_REF" \
+            --field filter="" \
+            --field use_runner_hf_cache=false
