@@ -149,6 +149,42 @@ class ModelDownloadTests(unittest.TestCase):
             )
 
 
+class SummaryTests(unittest.TestCase):
+    def report(self, model_id: str, cache_mode: str, attempts: int, elapsed: float):
+        with mock.patch.dict(os.environ, {"HF_CACHE_MODE": cache_mode}, clear=False):
+            return RUNNER.make_report(
+                RUNNER.Target(model_id=model_id, notebook=f"{model_id.split('/')[-1]}.ipynb"),
+                "oneclick",
+                f"oneclick__{model_id.split('/')[-1]}.ipynb",
+                {"source": "snapshot", "fetched_url": None, "snapshot": "snapshot"},
+                elapsed,
+                {},
+                None,
+                [],
+                download={
+                    "status": "PASSED",
+                    "attempts": attempts,
+                    "elapsed_seconds": elapsed,
+                    "cache_path": "/cache/hub",
+                    "error": None,
+                },
+            )
+
+    def test_summary_has_separate_tries_column_and_hides_runner_attempts(self):
+        reports = [
+            self.report("org/container-model", "container", 3, 12.0),
+            self.report("org/runner-model", "runner", 1, 1.0),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            RUNNER.write_summary(Path(directory), reports, "test-policy")
+            summary = (Path(directory) / "summary.md").read_text()
+
+        self.assertIn("| Model | Download | Model Download Tries |", summary)
+        self.assertIn("`org/container-model` | 12s | 3 |", summary)
+        self.assertIn("`org/runner-model` | 1s | \\ |", summary)
+        self.assertNotIn("(3x)", summary)
+
+
 class ModelJobTests(unittest.TestCase):
     def args(self):
         return SimpleNamespace(

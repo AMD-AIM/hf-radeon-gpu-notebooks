@@ -570,6 +570,15 @@ def format_duration(seconds: Any) -> str:
     return f"{seconds}s"
 
 
+def format_download_tries(report: dict[str, Any]) -> str:
+    cache_mode = str(
+        report.get("hf_cache_mode") or os.environ.get("HF_CACHE_MODE", "")
+    ).strip().lower()
+    if cache_mode == "runner":
+        return "\\"
+    return str(report.get("download_attempts", 0))
+
+
 def core_error(report: dict[str, Any]) -> str:
     if report.get("run_error"):
         return compact_error(report["run_error"])
@@ -744,8 +753,8 @@ def write_summary(
             f"{sum(r['overall_status'] == 'FAILED' for r in reports)} FAIL / "
             f"{sum(r['overall_status'] == 'ERROR' for r in reports)} ERROR**",
             "",
-            "| # | Status | Model | Download | Cells P/F/T | Peak VRAM | GPU util avg/peak | Total | Core error |",
-            "|--:|:------:|:------|---------:|:-----------:|:---------:|:-----------------:|------:|:-----------|",
+            "| # | Status | Model | Download | Model Download Tries | Cells P/F/T | Peak VRAM | GPU util avg/peak | Total | Core error |",
+            "|--:|:------:|:------|---------:|------:|:-----------:|:---------:|:-----------------:|------:|:-----------|",
         ]
         for index, report in enumerate(reports, 1):
             peak = report["vram_peak_gb"]
@@ -753,8 +762,8 @@ def write_summary(
             lines.append(
                 f"| {index} | {icon[report['overall_status']]} | "
                 f"`{report['model_id']}` | "
-                f"{format_duration(report.get('download_elapsed_seconds'))} "
-                f"({report.get('download_attempts', 0)}x) | "
+                f"{format_duration(report.get('download_elapsed_seconds'))} | "
+                f"{format_download_tries(report)} | "
                 f"{report['cells_passed']}/{report['cells_failed']}/{report['cells_total']} | "
                 f"{vram} | "
                 f"{format_pct(report.get('gpu_util_avg_pct'))}/"
@@ -1103,6 +1112,7 @@ def make_report(
         "cells_passed": passed,
         "cells_failed": failed,
         "cells_total": passed + failed,
+        "hf_cache_mode": os.environ.get("HF_CACHE_MODE", "").strip().lower() or "unknown",
         "download_status": download.get("status"),
         "download_attempts": download.get("attempts", 0),
         "download_elapsed_seconds": download.get("elapsed_seconds", 0.0),
