@@ -16,7 +16,7 @@ gh workflow run huggingface-oneclick-notebook-ci.yml \
   --repo AMD-AIM/hf-radeon-gpu-notebooks \
   --ref ci/huggingface_oneclick_workaround \
   --field filter="" \
-  --field use_runner_hf_cache=false
+  --field use_runner_hf_cache=true
 ```
 
 The default branch retains only this guide and a minimal `workflow_dispatch`
