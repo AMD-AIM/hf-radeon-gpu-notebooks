@@ -16,8 +16,9 @@ on:
           - "false"
           - "true"
   schedule:
-    # GitHub cron uses UTC: 10:00 UTC = 18:00 Beijing; 22:00 UTC = 06:00 Beijing next day.
-    - cron: "0 10,22 * * *"
+    # Run daily at 06:00 and 18:00 Beijing time.
+    - cron: "0 6,18 * * *"
+      timezone: "Asia/Shanghai"
 
 permissions:
   actions: write
