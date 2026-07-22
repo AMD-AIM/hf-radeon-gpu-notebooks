@@ -1,4 +1,4 @@
-name: schedule-huggingface-oneclick-workaround
+name: dispatch-huggingface-oneclick-workaround
 
 on:
   workflow_dispatch:
@@ -8,38 +8,36 @@ on:
         required: false
         default: ""
       use_runner_hf_cache:
-        description: "Forwarded cache mode; the scheduler always dispatches false"
+        description: "Forwarded cache mode"
         required: false
         default: "false"
         type: choice
         options:
           - "false"
           - "true"
-  schedule:
-    # Run daily at 06:05 and 18:05 Beijing time, avoiding top-of-hour load.
-    - cron: "5 6,18 * * *"
-      timezone: "Asia/Shanghai"
 
 permissions:
   actions: write
   contents: read
 
 concurrency:
-  group: schedule-huggingface-oneclick-workaround
+  group: dispatch-huggingface-oneclick-workaround
   cancel-in-progress: false
 
 jobs:
   dispatch-workaround:
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch cold-cache workaround CI
+      - name: Dispatch workaround CI
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_FILTER: ${{ inputs.filter }}
+          INPUT_USE_RUNNER_HF_CACHE: ${{ inputs.use_runner_hf_cache }}
           TARGET_REF: ci/huggingface_oneclick_workaround
           TARGET_WORKFLOW: huggingface-oneclick-notebook-ci.yml
         run: |
           gh workflow run "$TARGET_WORKFLOW" \
             --repo "$GITHUB_REPOSITORY" \
             --ref "$TARGET_REF" \
-            --field filter="" \
-            --field use_runner_hf_cache=false
+            --field filter="$INPUT_FILTER" \
+            --field use_runner_hf_cache="$INPUT_USE_RUNNER_HF_CACHE"
