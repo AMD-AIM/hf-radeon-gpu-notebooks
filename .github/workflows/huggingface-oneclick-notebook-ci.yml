@@ -10,11 +10,11 @@ on:
       use_runner_hf_cache:
         description: "Forwarded cache mode"
         required: false
-        default: "false"
+        default: "true"
         type: choice
         options:
-          - "false"
           - "true"
+          - "false"
 
 permissions:
   actions: write
