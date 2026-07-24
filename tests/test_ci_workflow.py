@@ -150,7 +150,7 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
     def test_workflow_identity_matches_radeon_global_branch(self):
         self.assertTrue(
             WORKFLOW_TEXT.startswith(
-                "name: HF One-Click CI - Radeon Global\n"
+                "name: HF One-Click CI\n"
                 'run-name: "[Run] Radeon Global CI"\n'
             )
         )

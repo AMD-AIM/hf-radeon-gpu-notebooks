@@ -1,4 +1,4 @@
-name: HF One-Click CI - Radeon Global
+name: HF One-Click CI
 run-name: "[Run] Radeon Global CI"
 
 on:
