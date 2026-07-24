@@ -90,16 +90,14 @@ class ProtocolSocket:
 
 class FakeJupyter:
     def __init__(self):
-        self.uploaded = []
         self.sessions = 0
+        self.session_paths = []
         self.deleted = []
         self.interrupted = []
 
-    def upload_notebook(self, path, notebook):
-        self.uploaded.append((path, notebook))
-
     def create_session(self, path):
         self.sessions += 1
+        self.session_paths.append(path)
         return f"session-{self.sessions}", f"kernel-{self.sessions}"
 
     def connect_channels(self, kernel_id, timeout):
@@ -277,6 +275,7 @@ class CellRetryTests(unittest.TestCase):
         ):
             result = RUNNER.execute_remote_notebook(
                 jupyter,
+                "cloud/model.ipynb",
                 notebook("first", "downloads-model", "tail"),
                 args(),
                 lambda *_: None,
@@ -290,7 +289,7 @@ class CellRetryTests(unittest.TestCase):
         self.assertEqual(result.elapsed_seconds, 40.0)
         self.assertIsNone(result.run_error)
         self.assertEqual(jupyter.sessions, 1)
-        self.assertFalse(Path(jupyter.uploaded[0][0]).name.startswith("."))
+        self.assertEqual(jupyter.session_paths, ["cloud/model.ipynb"])
 
     def test_three_failures_stop_before_remaining_cells(self):
         jupyter = FakeJupyter()
@@ -306,6 +305,7 @@ class CellRetryTests(unittest.TestCase):
         ):
             result = RUNNER.execute_remote_notebook(
                 jupyter,
+                "cloud/model.ipynb",
                 notebook("failing-download", "must-not-run"),
                 args(),
                 lambda *_: None,
@@ -339,6 +339,7 @@ class CellRetryTests(unittest.TestCase):
         ):
             result = RUNNER.execute_remote_notebook(
                 jupyter,
+                "cloud/model.ipynb",
                 notebook("state-setup", "model-cell", "tail"),
                 args(),
                 lambda *_: None,
@@ -353,30 +354,49 @@ class CellRetryTests(unittest.TestCase):
 
 
 class SourcePolicyTests(unittest.TestCase):
-    def test_controller_does_not_inject_a_separate_hf_download_cell(self):
+    def test_controller_leaves_notebook_provisioning_to_radeon_global(self):
         source = MODULE_PATH.read_text()
 
         self.assertNotIn('["hf", "download"', source)
         self.assertNotIn("ci_model_download", source)
+        self.assertNotIn("common.load_notebook", source)
+        self.assertNotIn("common.normalize_notebook", source)
+        self.assertNotIn("common.validate_plan", source)
+        self.assertNotIn("common.prune_original_notebook_snapshots", source)
+        self.assertNotIn("common.sync_original_notebook_snapshots", source)
+        self.assertNotIn("upload_notebook", source)
         self.assertIn("model_download=notebook-native", source)
         self.assertIn("sys.executable,", source)
         self.assertNotIn('["jupyter", "nbconvert"', source)
 
-    def test_invalid_singular_output_key_is_not_sent_or_written(self):
-        original = notebook("print('ok')")
-        original["cells"][0]["output"] = []
+    def test_cloud_notebook_path_comes_from_jupyter_url(self):
+        access_url = (
+            "https://example.invalid/instances/pod/lab/tree/folder/"
+            "My%20Notebook.ipynb?token=secret"
+        )
 
-        normalized = RUNNER.common.normalize_notebook(original)
-        normalized_user_cell = normalized["cells"][1]
-        normalized_user_cell["execution_count"] = 1
-        normalized_user_cell["outputs"] = [
-            {"output_type": "stream", "name": "stdout", "text": "ok\n"}
-        ]
-        artifact = RUNNER.common.build_artifact_notebook(original, normalized)
+        path = RUNNER.notebook_path_from_jupyter_url(access_url)
 
-        self.assertNotIn("output", normalized_user_cell)
-        self.assertNotIn("output", artifact["cells"][0])
-        self.assertEqual(artifact["cells"][0]["outputs"][0]["text"], "ok\n")
+        self.assertEqual(path, "folder/My Notebook.ipynb")
+
+    def test_cloud_notebook_is_read_through_jupyter_contents_api(self):
+        jupyter = RUNNER.JupyterClient(
+            "https://example.invalid/instances/pod/lab/tree/model.ipynb?token=secret"
+        )
+        cloud_notebook = notebook("print('cloud managed')")
+        with mock.patch.object(
+            jupyter,
+            "_request",
+            return_value={
+                "type": "notebook",
+                "format": "json",
+                "content": cloud_notebook,
+            },
+        ) as request:
+            result = jupyter.get_notebook("folder/model.ipynb")
+
+        self.assertIs(result, cloud_notebook)
+        request.assert_called_once_with("GET", "contents/folder/model.ipynb")
 
     def test_known_secrets_are_redacted_recursively_from_artifact_values(self):
         secret = "hf_example_secret_value"
@@ -396,28 +416,14 @@ class SourcePolicyTests(unittest.TestCase):
 class PodSummaryTests(unittest.TestCase):
     def test_summary_marks_download_as_in_notebook_and_reports_cell_retries(self):
         target = RUNNER.common.Target("org/model", "org__model.ipynb")
-        with mock.patch.dict(os.environ, {"HF_CACHE_MODE": "pod"}, clear=False):
-            report = RUNNER.common.make_report(
-                target,
-                "radeon-pod",
-                "radeon-pod__org__model.ipynb",
-                {"source": "snapshot", "fetched_url": None, "snapshot": "snapshot"},
-                42.0,
-                {
-                    "vram_peak_gb": None,
-                    "gpu_util_avg_pct": None,
-                    "gpu_util_peak_pct": None,
-                },
-                None,
-                [{"index": 1, "status": "PASSED", "error": None}],
-                download={
-                    "status": "IN_NOTEBOOK",
-                    "attempts": 0,
-                    "elapsed_seconds": 0.0,
-                    "cache_path": "pod-local",
-                    "error": None,
-                },
-            )
+        report = RUNNER.common.make_report(
+            target,
+            "radeon-pod__org__model.ipynb",
+            42.0,
+            None,
+            [{"index": 1, "status": "PASSED", "error": None}],
+            None,
+        )
         report["cell_execution_retries"] = 2
 
         with tempfile.TemporaryDirectory() as directory:
@@ -426,7 +432,7 @@ class PodSummaryTests(unittest.TestCase):
 
         self.assertIn("| Model | Download | Model Download Tries | Cell Retries |", summary)
         self.assertIn("`org/model` | in notebook | \\ | 2 |", summary)
-        self.assertIn("| n/a | n/a/n/a | 42s |", summary)
+        self.assertIn("| 1/0/1 | 42s |", summary)
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ on:
     branches: [hf_oneclick_radeon_global]
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: huggingface-oneclick-ci
@@ -21,11 +21,14 @@ concurrency:
 jobs:
   run-notebooks:
     # The controller keeps the existing long-running self-hosted budget, but
-    # does not use this runner's GPU, Docker, or Hugging Face model cache.
+    # uses only an isolated, CPU-only Docker container on this runner. Model
+    # code and the workaround image run in the remote Radeon Global Pod.
     runs-on: [self-hosted, rocm, w7900]
     timeout-minutes: 2880
     env:
       HF_ENDPOINT: http://134.199.133.77
+      RADEON_CONTROLLER_IMAGE: ${{ vars.RADEON_CONTROLLER_IMAGE }}
+      RADEON_CONTROLLER_NAME: hf-ci-radeon-global-controller-${{ github.run_id }}
       RADEON_NOTEBOOK_API: https://radeon-global.anruicloud.com/api/huggingface/notebooks
       RADEON_POD_IMAGE: 10.5.10.12:1808/radeon-cloud-global/huaggingface_for_amd_radeon:20260711_workaround_fix_torch_streaming
       RADEON_POD_STATE: .radeon-pod-ci-state.json
@@ -43,7 +46,7 @@ jobs:
         id: checkout
         timeout-minutes: 15
         # This runner is in mainland China. Scope the read-only proxy rewrite
-        # to checkout; authenticated pull/push later keep their existing policy.
+        # to repository checkout only.
         env:
           GIT_CONFIG_COUNT: "1"
           GIT_CONFIG_KEY_0: "url.https://gh-test.anruicloud.com/.insteadOf"
@@ -51,32 +54,45 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          persist-credentials: true
+          persist-credentials: false
           clean: false
           sparse-checkout: |
             .github
             doc
-            original_notebooks
             tests
             tools
           sparse-checkout-cone-mode: true
 
-      - name: Confirm target commit
+      - name: Remove interrupted controller containers
         run: |
-          git checkout -f "${{ github.sha }}"
-          git log --oneline -1
+          docker ps -aq \
+            --filter "label=ai.amd.hf-radeon-global-controller=true" \
+            | xargs -r docker rm -f
 
-      - name: Install controller dependencies
+      - name: Pull prebuilt controller image
         run: |
-          CONTROLLER_VENV="$RUNNER_TEMP/hf-radeon-pod-controller-${{ github.run_id }}"
-          echo "CONTROLLER_VENV=$CONTROLLER_VENV" >> "$GITHUB_ENV"
-          python3 -m venv "$CONTROLLER_VENV"
-          "$CONTROLLER_VENV/bin/python" -m pip install --disable-pip-version-check \
-            -r tools/requirements-radeon-pod-ci.txt
+          if [ -z "${RADEON_CONTROLLER_IMAGE:-}" ]; then
+            echo "::error::RADEON_CONTROLLER_IMAGE repository variable is required"
+            exit 1
+          fi
+          if [[ "$RADEON_CONTROLLER_IMAGE" != *:latest ]]; then
+            echo "::error::RADEON_CONTROLLER_IMAGE must use the :latest tag"
+            exit 1
+          fi
+
+          for attempt in 1 2 3; do
+            if docker pull "$RADEON_CONTROLLER_IMAGE"; then
+              exit 0
+            fi
+            echo "::warning::controller image pull failed on attempt ${attempt}/3"
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Run controller unit tests
         run: |
-          "$CONTROLLER_VENV/bin/python" -m unittest discover -s tests -v
+          tools/run_radeon_controller_container.sh tests \
+            python -m unittest discover -s tests -v
 
       - name: Recover owned Pod from an interrupted run
         env:
@@ -84,7 +100,8 @@ jobs:
           RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}
         run: |
           if [ -f "$RADEON_POD_STATE" ]; then
-            "$CONTROLLER_VENV/bin/python" -u tools/run_radeon_pod_notebooks.py \
+            tools/run_radeon_controller_container.sh recover \
+              python -u tools/run_radeon_pod_notebooks.py \
               --cleanup-state \
               --state-file "$RADEON_POD_STATE"
           fi
@@ -120,8 +137,8 @@ jobs:
             --fail-on none
           )
           if [ -n "$FILTER" ]; then args+=(--filter "$FILTER"); fi
-          "$CONTROLLER_VENV/bin/python" -u \
-            tools/run_radeon_pod_notebooks.py "${args[@]}"
+          tools/run_radeon_controller_container.sh execute \
+            python -u tools/run_radeon_pod_notebooks.py "${args[@]}"
 
       - name: Ensure owned Radeon Pod is deleted
         if: always()
@@ -129,66 +146,24 @@ jobs:
           RADEON_API_TOKEN: ${{ secrets.RADEON_API_TOKEN }}
           RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}
         run: |
+          cleanup_status=0
+          for suffix in tests recover execute cleanup; do
+            docker rm -f \
+              "${RADEON_CONTROLLER_NAME}-${suffix}" 2>/dev/null || true
+          done
+
           if [ -f "$RADEON_POD_STATE" ]; then
-            PYTHON="${CONTROLLER_VENV:-}/bin/python"
-            if [ -z "${CONTROLLER_VENV:-}" ] || [ ! -x "$PYTHON" ]; then
-              PYTHON=python3
+            if tools/run_radeon_controller_container.sh cleanup \
+              python -u tools/run_radeon_pod_notebooks.py \
+                --cleanup-state \
+                --state-file "$RADEON_POD_STATE"
+            then
+              :
+            else
+              cleanup_status=$?
             fi
-            "$PYTHON" -u tools/run_radeon_pod_notebooks.py \
-              --cleanup-state \
-              --state-file "$RADEON_POD_STATE"
           fi
-
-      - name: Sync downloaded notebook snapshots
-        if: always() && steps.checkout.outcome == 'success' && startsWith(github.ref, 'refs/heads/')
-        run: |
-          BRANCH="${GITHUB_REF_NAME}"
-          if [ -z "$BRANCH" ]; then
-            echo "No branch ref is available; skip original_notebooks sync."
-            exit 0
-          fi
-
-          if [ ! -d original_notebooks ]; then
-            echo "original_notebooks was not created; nothing to sync."
-            exit 0
-          fi
-
-          git add original_notebooks
-          if git diff --cached --quiet -- original_notebooks; then
-            echo "No downloaded notebook snapshot changes."
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "Update original notebooks from Hugging Face [skip ci]"
-
-          retry_git() {
-            local attempt
-            for attempt in 1 2 3 4 5; do
-              if "$@"; then
-                return 0
-              fi
-              echo "::warning::git command failed on attempt ${attempt}/5: $*"
-              sleep $((attempt * 20))
-            done
-            return 1
-          }
-
-          git_via_fetch_proxy() {
-            git \
-              -c "url.https://gh-test.anruicloud.com/.insteadOf=https://github.com/" \
-              "$@"
-          }
-
-          if ! retry_git git_via_fetch_proxy pull --rebase origin "$BRANCH"; then
-            echo "::warning::Could not rebase downloaded notebook snapshot update; leaving CI result unchanged."
-            exit 0
-          fi
-          if ! retry_git git push origin "HEAD:$BRANCH"; then
-            echo "::warning::Could not push downloaded notebook snapshot update; leaving CI result unchanged."
-            exit 0
-          fi
+          exit "$cleanup_status"
 
       - name: Publish summary
         if: always()

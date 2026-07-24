@@ -135,14 +135,12 @@ class WorkflowOutputIsolationTests(unittest.TestCase):
 
 
 class WorkflowFailureHandlingTests(unittest.TestCase):
-    def test_post_checkout_mutations_and_upload_require_checkout_success(self):
+    def test_artifact_upload_requires_checkout_success(self):
         checkout = step_block("Checkout target revision")
-        sync = step_block("Sync downloaded notebook snapshots")
         upload = step_block("Upload results")
 
         self.assertIn("        id: checkout\n", checkout)
         checkout_guard = "steps.checkout.outcome == 'success'"
-        self.assertIn(checkout_guard, sync)
         self.assertIn(checkout_guard, upload)
 
 
@@ -159,19 +157,29 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
             WORKFLOW_TEXT,
         )
 
-    def test_self_hosted_runner_is_only_a_long_running_pod_controller(self):
+    def test_self_hosted_runner_uses_only_an_isolated_controller_container(self):
         execute = step_block("Execute notebook CI")
+        wrapper = (
+            REPO / "tools" / "run_radeon_controller_container.sh"
+        ).read_text()
 
         self.assertIn("    runs-on: [self-hosted, rocm, w7900]", WORKFLOW_TEXT)
-        self.assertIn("does not use this runner's GPU, Docker", WORKFLOW_TEXT)
+        self.assertIn("isolated, CPU-only Docker container", WORKFLOW_TEXT)
+        self.assertIn("tools/run_radeon_controller_container.sh", execute)
         self.assertIn("tools/run_radeon_pod_notebooks.py", execute)
         self.assertIn("RADEON_API_TOKEN: ${{ secrets.RADEON_API_TOKEN }}", execute)
         self.assertIn("RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}", execute)
-        self.assertNotIn("docker run", WORKFLOW_TEXT)
+        self.assertIn("exec docker run --rm", wrapper)
+        self.assertIn('--user "$(id -u):$(id -g)"', wrapper)
+        self.assertIn('--volume "$GITHUB_WORKSPACE:/workspace"', wrapper)
         self.assertNotIn("select_idle_rocm_gpu.py", WORKFLOW_TEXT)
+        self.assertNotIn("--device", wrapper)
         self.assertNotIn("/dev/kfd", WORKFLOW_TEXT)
+        self.assertNotIn("/dev/kfd", wrapper)
         self.assertNotIn("/disk/ssd2/huggingface_cache", WORKFLOW_TEXT)
         self.assertNotIn("use_runner_hf_cache", WORKFLOW_TEXT)
+        self.assertNotIn("python3 -m venv", WORKFLOW_TEXT)
+        self.assertNotIn("python3 -u tools/run_radeon_pod_notebooks.py", WORKFLOW_TEXT)
 
     def test_owned_pod_cleanup_runs_even_after_failure(self):
         cleanup = step_block("Ensure owned Radeon Pod is deleted")
@@ -182,24 +190,67 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
         self.assertNotIn("results/", cleanup)
         self.assertLess(
             WORKFLOW_TEXT.index("      - name: Ensure owned Radeon Pod is deleted\n"),
-            WORKFLOW_TEXT.index("      - name: Sync downloaded notebook snapshots\n"),
+            WORKFLOW_TEXT.index("      - name: Publish summary\n"),
         )
 
-    def test_controller_dependencies_and_tests_run_before_notebooks(self):
-        install = WORKFLOW_TEXT.index("      - name: Install controller dependencies\n")
+    def test_prebuilt_controller_image_and_tests_run_before_notebooks(self):
+        pull = WORKFLOW_TEXT.index("      - name: Pull prebuilt controller image\n")
         unit_tests = WORKFLOW_TEXT.index("      - name: Run controller unit tests\n")
         execute = WORKFLOW_TEXT.index("      - name: Execute notebook CI\n")
+        pull_step = step_block("Pull prebuilt controller image")
 
-        self.assertLess(install, unit_tests)
+        self.assertLess(pull, unit_tests)
         self.assertLess(unit_tests, execute)
         self.assertIn(
-            "-r tools/requirements-radeon-pod-ci.txt",
-            step_block("Install controller dependencies"),
+            "RADEON_CONTROLLER_IMAGE: ${{ vars.RADEON_CONTROLLER_IMAGE }}",
+            WORKFLOW_TEXT,
         )
-        self.assertIn(
-            '>> "$GITHUB_ENV"',
-            step_block("Install controller dependencies"),
-        )
+        self.assertIn('docker pull "$RADEON_CONTROLLER_IMAGE"', pull_step)
+        self.assertIn("must use the :latest tag", pull_step)
+        self.assertNotIn("docker build", WORKFLOW_TEXT)
+        self.assertNotIn("RADEON_CONTROLLER_BASE_IMAGE", WORKFLOW_TEXT)
+        self.assertNotIn("RADEON_CONTROLLER_PIP_INDEX", WORKFLOW_TEXT)
+
+    def test_controller_wrapper_mounts_workspace_without_exposing_secret_values(self):
+        wrapper = REPO / "tools" / "run_radeon_controller_container.sh"
+        with (
+            tempfile.TemporaryDirectory() as bin_directory,
+            tempfile.TemporaryDirectory() as workspace_directory,
+        ):
+            fake_docker = Path(bin_directory) / "docker"
+            fake_docker.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$@\"\n"
+            )
+            fake_docker.chmod(0o755)
+            secret = "radeon-secret-must-not-be-printed"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": f"{bin_directory}:{environment['PATH']}",
+                    "GITHUB_WORKSPACE": workspace_directory,
+                    "RADEON_CONTROLLER_IMAGE": "controller:test",
+                    "RADEON_CONTROLLER_NAME": "controller-run",
+                    "RADEON_API_TOKEN": secret,
+                }
+            )
+
+            result = subprocess.run(
+                [str(wrapper), "tests", "python", "--version"],
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        arguments = result.stdout.splitlines()
+        self.assertEqual(arguments[0], "run")
+        self.assertIn("controller-run-tests", arguments)
+        self.assertIn("RADEON_API_TOKEN", arguments)
+        self.assertIn(f"{workspace_directory}:/workspace", arguments)
+        self.assertIn("controller:test", arguments)
+        self.assertNotIn("--device", arguments)
+        self.assertNotIn(secret, result.stdout)
 
     def test_models_are_processed_strictly_serially(self):
         controller = (REPO / "tools" / "run_radeon_pod_notebooks.py").read_text()
@@ -224,23 +275,17 @@ class WorkflowGitTransportTests(unittest.TestCase):
             checkout,
         )
         self.assertIn('GIT_CONFIG_VALUE_0: "https://github.com/"', checkout)
-        self.assertIn("persist-credentials: true", checkout)
+        self.assertIn("persist-credentials: false", checkout)
         self.assertNotIn("github-server-url:", checkout)
         self.assertNotIn("GIT_CONFIG_KEY_0:", job_prefix)
 
-    def test_notebook_sync_pulls_via_proxy_but_pushes_directly(self):
-        sync = step_block("Sync downloaded notebook snapshots")
-
-        self.assertIn(
-            '"url.https://gh-test.anruicloud.com/.insteadOf=https://github.com/"',
-            sync,
-        )
-        self.assertIn(
-            'retry_git git_via_fetch_proxy pull --rebase origin "$BRANCH"',
-            sync,
-        )
-        self.assertIn('retry_git git push origin "HEAD:$BRANCH"', sync)
-        self.assertNotIn("git_via_fetch_proxy push", sync)
+    def test_global_workflow_has_no_notebook_repository_mutations(self):
+        self.assertIn("permissions:\n  contents: read\n", WORKFLOW_TEXT)
+        self.assertNotIn("contents: write", WORKFLOW_TEXT)
+        self.assertNotIn("original_notebooks", WORKFLOW_TEXT)
+        self.assertNotIn("Sync downloaded notebook snapshots", WORKFLOW_TEXT)
+        self.assertNotIn("git push", WORKFLOW_TEXT)
+        self.assertNotIn("git commit", WORKFLOW_TEXT)
 
 
 if __name__ == "__main__":

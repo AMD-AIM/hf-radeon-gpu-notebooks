@@ -22,9 +22,9 @@ from pathlib import Path
 from typing import Any, Callable
 
 try:
-    import run_notebooks as common
+    import radeon_global_ci_common as common
 except ModuleNotFoundError:
-    from tools import run_notebooks as common
+    from tools import radeon_global_ci_common as common
 
 
 DEFAULT_RADEON_API = "https://radeon-global.anruicloud.com/api/huggingface/notebooks"
@@ -96,6 +96,21 @@ def find_jupyter_url(value: Any) -> str | None:
             candidate = find_jupyter_url(child)
             if candidate:
                 return candidate
+    return None
+
+
+def notebook_path_from_jupyter_url(access_url: str) -> str | None:
+    parsed = urllib.parse.urlsplit(access_url)
+    for marker in ("/lab/tree/", "/tree/", "/notebooks/"):
+        if marker not in parsed.path:
+            continue
+        candidate = urllib.parse.unquote(parsed.path.split(marker, 1)[1]).lstrip("/")
+        parts = candidate.split("/")
+        if (
+            candidate.lower().endswith(".ipynb")
+            and all(part not in {"", ".", ".."} for part in parts)
+        ):
+            return candidate
     return None
 
 
@@ -476,17 +491,39 @@ class JupyterClient:
                 )
             time.sleep(poll_seconds)
 
-    def upload_notebook(self, path: str, notebook: dict[str, Any]) -> None:
+    def get_notebook(self, path: str) -> dict[str, Any]:
         encoded_path = urllib.parse.quote(path, safe="/")
-        self._request(
-            "PUT",
-            f"contents/{encoded_path}",
-            {
-                "type": "notebook",
-                "format": "json",
-                "content": notebook,
-            },
-        )
+        result = self._request("GET", f"contents/{encoded_path}")
+        content = result.get("content")
+        if result.get("type") != "notebook" or not isinstance(content, dict):
+            raise JupyterAPIError(
+                f"cloud-managed path {path!r} is not a Jupyter notebook"
+            )
+        if not isinstance(content.get("cells"), list):
+            raise JupyterAPIError(
+                f"cloud-managed notebook {path!r} has no cell list"
+            )
+        return content
+
+    def wait_notebook(
+        self,
+        path: str,
+        timeout: float,
+        poll_seconds: float,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        last_error = ""
+        while True:
+            try:
+                return self.get_notebook(path)
+            except JupyterAPIError as exc:
+                last_error = str(exc)
+            if time.monotonic() >= deadline:
+                raise JupyterAPIError(
+                    f"cloud-managed notebook {path!r} was not available within "
+                    f"{int(timeout)}s: {common.compact_error(last_error, 300)}"
+                )
+            time.sleep(poll_seconds)
 
     def create_session(self, path: str) -> tuple[str, str]:
         result = self._request(
@@ -521,8 +558,7 @@ class JupyterClient:
             import websocket
         except ModuleNotFoundError:
             raise JupyterAPIError(
-                "websocket-client is required; install tools/"
-                "requirements-radeon-pod-ci.txt"
+                "the controller image must provide websocket-client"
             ) from None
         url = self._url(
             f"kernels/{urllib.parse.quote(kernel_id, safe='')}/channels",
@@ -795,16 +831,14 @@ def close_kernel_session(
 
 def execute_remote_notebook(
     jupyter: JupyterClient,
-    normalized: dict[str, Any],
+    remote_path: str,
+    cloud_notebook: dict[str, Any],
     args: argparse.Namespace,
     emit: Callable[[str, bool], None],
 ) -> RemoteExecution:
-    notebook = copy.deepcopy(normalized)
-    # Jupyter's default ContentsManager rejects hidden files even when the
-    # notebook root itself is writable, so the ephemeral name must not start
-    # with a dot.
-    remote_path = f"ci-{uuid.uuid4().hex}.ipynb"
-    jupyter.upload_notebook(remote_path, notebook)
+    # Keep execution outputs in a controller-side copy. The cloud-managed
+    # notebook is neither normalized nor overwritten through the Contents API.
+    notebook = copy.deepcopy(cloud_notebook)
 
     code_cell_indexes = [
         index
@@ -1040,9 +1074,7 @@ def save_report(
     target: common.Target,
     results_dir: Path,
     artifact_name: str,
-    original: dict[str, Any] | None,
-    source_info: dict[str, str | None],
-    preparation_elapsed: float,
+    remote_notebook_path: str | None,
     execution: RemoteExecution | None,
     run_error: str | None,
     started_at: str | None,
@@ -1055,28 +1087,11 @@ def save_report(
     elapsed = execution.elapsed_seconds if execution else 0.0
     report = common.make_report(
         target,
-        "radeon-pod",
         artifact_name,
-        source_info,
         elapsed,
-        {
-            "vram_peak_gb": None,
-            "gpu_util_avg_pct": None,
-            "gpu_util_peak_pct": None,
-            "gpu_util_samples": 0,
-        },
         common.redact_secrets(run_error) if run_error else None,
         cells,
-        download={
-            "status": "IN_NOTEBOOK",
-            "attempts": 0,
-            "elapsed_seconds": 0.0,
-            "cache_path": "pod-local",
-            "error": None,
-        },
-        notebook_elapsed=elapsed,
-        notebook_preparation_elapsed=preparation_elapsed,
-        started_at=execution.timed_started_at if execution else started_at,
+        execution.timed_started_at if execution else started_at,
     )
     user_attempts = [int(cell.get("attempts") or 0) for cell in cells]
     report.update(
@@ -1084,6 +1099,7 @@ def save_report(
             "pod_setup_elapsed_seconds": pod_setup_elapsed,
             "pod_delete_elapsed_seconds": pod_delete_elapsed,
             "timing_scope": "first-kernel-cell-start-to-last-kernel-cell-idle",
+            "remote_notebook_path": remote_notebook_path,
             "cell_execution_attempts": sum(attempts.values()),
             "cell_execution_retries": sum(max(0, value - 1) for value in attempts.values()),
             "max_user_cell_attempts": max(user_attempts, default=0),
@@ -1100,16 +1116,11 @@ def save_report(
         report,
     )
 
-    if original is not None and execution is not None:
-        import nbformat
-
+    if execution is not None:
         output_notebook = results_dir / artifact_name
         safe_executed_notebook = redact_json_secrets(execution.notebook)
-        nbformat.write(
-            nbformat.from_dict(
-                common.build_artifact_notebook(original, safe_executed_notebook)
-            ),
-            str(output_notebook),
+        output_notebook.write_text(
+            json.dumps(safe_executed_notebook, indent=1, ensure_ascii=False) + "\n"
         )
         conversion = subprocess.run(
             [
@@ -1145,15 +1156,7 @@ def run_one(
 ) -> dict[str, Any]:
     artifact_name = f"radeon-pod__{target.notebook}"
     log_path = results_dir / artifact_name.replace(".ipynb", ".log")
-    source_info: dict[str, str | None] = {
-        "source": None,
-        "fetched_url": None,
-        "snapshot": None,
-    }
-    original: dict[str, Any] | None = None
-    normalized: dict[str, Any] | None = None
-    preparation_started = time.monotonic()
-    preparation_elapsed = 0.0
+    remote_notebook_path: str | None = None
     execution: RemoteExecution | None = None
     run_error: str | None = None
     started_at: str | None = None
@@ -1171,33 +1174,6 @@ def run_one(
                 print(safe, flush=True)
 
         emit(f"# {artifact_name} ({target.model_id}) mode=radeon-pod")
-        emit(f"# notebook_preparation_started {common.utc_now()}")
-        try:
-            original, source_info = common.load_notebook(target)
-            normalized = common.normalize_notebook(original)
-        except Exception as exc:
-            preparation_elapsed = round(time.monotonic() - preparation_started, 3)
-            run_error = f"{type(exc).__name__}: {exc}"
-            emit(f"# notebook_preparation={preparation_elapsed}s (excluded)")
-            emit(f"[SOURCE-ERROR] {run_error}", True)
-            return save_report(
-                target,
-                results_dir,
-                artifact_name,
-                original,
-                source_info,
-                preparation_elapsed,
-                None,
-                run_error,
-                None,
-                0.0,
-                0.0,
-            )
-
-        preparation_elapsed = round(time.monotonic() - preparation_started, 3)
-        emit(f"# source={source_info.get('source')}")
-        emit(f"# fetched_url={source_info.get('fetched_url')}")
-        emit(f"# notebook_preparation={preparation_elapsed}s (excluded)")
 
         pod_setup_started = time.monotonic()
         try:
@@ -1234,13 +1210,31 @@ def run_one(
                 args.jupyter_ready_timeout,
                 args.pod_poll_seconds,
             )
+            remote_path = notebook_path_from_jupyter_url(access_url)
+            if not remote_path:
+                raise RadeonPodError(
+                    "ready Radeon Pod URL did not identify a cloud-managed notebook"
+                )
+            cloud_notebook = jupyter.wait_notebook(
+                remote_path,
+                args.jupyter_ready_timeout,
+                args.pod_poll_seconds,
+            )
+            remote_notebook_path = remote_path
             pod_setup_elapsed = round(time.monotonic() - pod_setup_started, 3)
             emit(
                 f"# pod_setup={pod_setup_elapsed}s (excluded) "
                 f"instance_id={created_instance_id or 'unknown'}"
             )
+            emit(f"# cloud_notebook={remote_path} (managed by Radeon Global)")
 
-            execution = execute_remote_notebook(jupyter, normalized, args, emit)
+            execution = execute_remote_notebook(
+                jupyter,
+                remote_path,
+                cloud_notebook,
+                args,
+                emit,
+            )
             started_at = execution.timed_started_at
             run_error = execution.run_error
         except (RadeonPodError, JupyterAPIError, OSError, ValueError) as exc:
@@ -1283,9 +1277,7 @@ def run_one(
             target,
             results_dir,
             artifact_name,
-            original,
-            source_info,
-            preparation_elapsed,
+            remote_notebook_path,
             execution,
             run_error,
             started_at,
@@ -1325,6 +1317,24 @@ def build_client(args: argparse.Namespace) -> RadeonPodClient:
     )
 
 
+def validate_cloud_plan(targets: list[common.Target]) -> list[str]:
+    errors: list[str] = []
+    print(f"Plan contains {len(targets)} Radeon Global notebook job(s).", flush=True)
+    for target in targets:
+        notebook_url = f"https://huggingface.co/{target.model_id}.ipynb"
+        if not target.model_id.strip() or not target.notebook.lower().endswith(".ipynb"):
+            error = f"invalid target mapping: {target.model_id!r}, {target.notebook!r}"
+            errors.append(error)
+            print(f"[PLAN ERR] {error}", flush=True)
+            continue
+        print(
+            f"[PLAN OK] radeon-pod {target.model_id:45} "
+            f"artifact={target.notebook:45} cloud_source={notebook_url}",
+            flush=True,
+        )
+    return errors
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", default="results")
@@ -1353,24 +1363,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--echo-output", action="store_true")
     parser.add_argument("--echo-traceback", action="store_true")
-    parser.add_argument("--env-file", default="")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.env_file:
-        common.load_env_file(args.env_file)
-    os.environ["HF_CACHE_MODE"] = "pod"
 
     target_file = Path(args.target_file)
-    snapshot_targets = common.load_targets(target_file, "", include_disabled=True)
     targets = common.load_targets(target_file, args.filter)
     if not targets and not args.cleanup_state:
         raise SystemExit(f"no enabled targets matched filter {args.filter!r}")
 
     if args.plan_only:
-        errors = common.validate_plan(targets)
+        errors = validate_cloud_plan(targets)
         raise SystemExit(1 if errors else 0)
 
     client = build_client(args)
@@ -1385,17 +1390,16 @@ def main() -> None:
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
-    common.prune_original_notebook_snapshots(snapshot_targets)
     policy = (
-        f"source=hf-oneclick; fail_on={args.fail_on}; backend=radeon-pod; "
+        f"source=radeon-global-managed; fail_on={args.fail_on}; "
+        "backend=radeon-pod; "
         "pod_per_model=true; model_download=notebook-native; "
         f"cell_attempts={CELL_EXECUTION_ATTEMPTS}; "
         f"kernel_session_attempts={KERNEL_SESSION_ATTEMPTS}; "
         "timing=first-kernel-cell-start-to-last-kernel-cell-idle; "
-        "notebook-preparation/pod-create/pod-delete=excluded"
+        "cloud-notebook-setup/pod-create/pod-delete=excluded"
     )
     reports: list[dict[str, Any]] = []
-    synced_notebooks: set[str] = set()
     pending = [f"radeon-pod__{target.notebook}" for target in targets]
     common.write_progress(results_dir, reports, pending)
 
@@ -1409,19 +1413,16 @@ def main() -> None:
         pending.remove(run_name)
         print(
             f"==> START {run_name} ({target.model_id}): "
-            "prepare (excluded) -> create Pod (excluded) -> "
+            "create Pod and use its cloud-managed notebook (excluded) -> "
             "notebook cells with retry (timed) -> delete Pod (excluded)",
             flush=True,
         )
         common.write_progress(results_dir, reports, pending, running=run_name)
         report = run_one(target, args, results_dir, client)
-        if report.get("fetched_url"):
-            synced_notebooks.add(target.notebook)
         reports.append(report)
         common.write_summary(results_dir, reports, policy)
         common.write_progress(results_dir, reports, pending)
 
-    common.sync_original_notebook_snapshots(snapshot_targets, synced_notebooks)
     common.write_summary(results_dir, reports, policy)
 
     if args.fail_on == "all":
