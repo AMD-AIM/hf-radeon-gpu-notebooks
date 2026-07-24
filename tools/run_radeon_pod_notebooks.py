@@ -397,6 +397,39 @@ def cleanup_matching_current_pod(
     return round(time.monotonic() - started, 3)
 
 
+def reset_current_pod_before_run(
+    client: RadeonPodClient,
+    state_path: Path,
+    delete_timeout: float,
+    poll_seconds: float,
+) -> float:
+    """Delete one pre-existing Pod before the serial model run starts."""
+    started = time.monotonic()
+    current = client.current()
+    status = response_status(current)
+    if status == "not_found":
+        print("[POD] startup reset: no existing instance", flush=True)
+        elapsed = round(time.monotonic() - started, 3)
+        state_path.unlink(missing_ok=True)
+        return elapsed
+    if not status:
+        raise RadeonPodError(
+            "startup reset could not determine the current Radeon Pod status"
+        )
+
+    instance_id = response_instance_id(current) or "unknown"
+    print(
+        f"[POD] startup reset: deleting existing instance "
+        f"status={status}, instance_id={instance_id}",
+        flush=True,
+    )
+    client.delete_current()
+    client.wait_deleted(delete_timeout, poll_seconds)
+    elapsed = round(time.monotonic() - started, 3)
+    state_path.unlink(missing_ok=True)
+    return elapsed
+
+
 class JupyterClient:
     def __init__(self, access_url: str, request_timeout: int = 60) -> None:
         parsed = urllib.parse.urlsplit(access_url)
@@ -1379,20 +1412,30 @@ def main() -> None:
         raise SystemExit(1 if errors else 0)
 
     client = build_client(args)
+    state_path = Path(args.state_file)
     if args.cleanup_state:
         cleanup_owned_pod(
             client,
-            Path(args.state_file),
+            state_path,
             args.pod_delete_timeout,
             args.pod_poll_seconds,
         )
         return
+
+    reset_elapsed = reset_current_pod_before_run(
+        client,
+        state_path,
+        args.pod_delete_timeout,
+        args.pod_poll_seconds,
+    )
+    print(f"[POD] startup reset completed in {reset_elapsed}s", flush=True)
 
     results_dir = Path(args.results_dir)
     results_dir.mkdir(parents=True, exist_ok=True)
     policy = (
         f"source=radeon-global-managed; fail_on={args.fail_on}; "
         "backend=radeon-pod; "
+        "startup_current_pod_reset=true; "
         "pod_per_model=true; model_download=notebook-native; "
         f"cell_attempts={CELL_EXECUTION_ATTEMPTS}; "
         f"kernel_session_attempts={KERNEL_SESSION_ATTEMPTS}; "

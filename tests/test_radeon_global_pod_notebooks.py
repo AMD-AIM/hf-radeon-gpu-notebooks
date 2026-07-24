@@ -216,6 +216,67 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
             delete.assert_not_called()
             self.assertTrue(state.exists())
 
+    def test_startup_reset_deletes_one_preexisting_pod_and_waits(self):
+        client = self.client()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.write_text("stale state")
+            with (
+                mock.patch.object(
+                    client,
+                    "current",
+                    return_value={
+                        "status": "ready",
+                        "instance_id": "leftover-instance",
+                    },
+                ),
+                mock.patch.object(client, "delete_current") as delete,
+                mock.patch.object(client, "wait_deleted") as wait_deleted,
+                mock.patch.object(
+                    RUNNER.time,
+                    "monotonic",
+                    side_effect=[100.0, 104.0],
+                ),
+            ):
+                elapsed = RUNNER.reset_current_pod_before_run(
+                    client, state, 600, 5
+                )
+
+            self.assertFalse(state.exists())
+
+        self.assertEqual(elapsed, 4.0)
+        delete.assert_called_once_with()
+        wait_deleted.assert_called_once_with(600, 5)
+
+    def test_startup_reset_is_a_noop_when_no_pod_exists(self):
+        client = self.client()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            state.write_text("stale state")
+            with (
+                mock.patch.object(
+                    client,
+                    "current",
+                    return_value={"status": "not_found"},
+                ),
+                mock.patch.object(client, "delete_current") as delete,
+                mock.patch.object(client, "wait_deleted") as wait_deleted,
+                mock.patch.object(
+                    RUNNER.time,
+                    "monotonic",
+                    side_effect=[100.0, 100.5],
+                ),
+            ):
+                elapsed = RUNNER.reset_current_pod_before_run(
+                    client, state, 600, 5
+                )
+
+            self.assertFalse(state.exists())
+
+        self.assertEqual(elapsed, 0.5)
+        delete.assert_not_called()
+        wait_deleted.assert_not_called()
+
 
 class CellRetryTests(unittest.TestCase):
     def test_execute_request_waits_for_reply_and_idle_and_collects_output(self):

@@ -260,6 +260,14 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
             "        report = run_one(target, args, results_dir, client)\n",
             controller,
         )
+        main = controller[controller.index("def main() -> None:"):]
+        reset_call = "reset_current_pod_before_run(\n        client,"
+        self.assertEqual(main.count(reset_call), 1)
+        self.assertLess(
+            main.index(reset_call),
+            main.index("    for target in targets:\n"),
+        )
+        self.assertNotIn("Recover owned Pod from an interrupted run", WORKFLOW_TEXT)
         self.assertNotIn("matrix:", WORKFLOW_TEXT)
         self.assertNotIn("strategy:", WORKFLOW_TEXT)
 

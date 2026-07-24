@@ -94,18 +94,6 @@ jobs:
           tools/run_radeon_controller_container.sh tests \
             python -m unittest discover -s tests -v
 
-      - name: Recover owned Pod from an interrupted run
-        env:
-          RADEON_API_TOKEN: ${{ secrets.RADEON_API_TOKEN }}
-          RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}
-        run: |
-          if [ -f "$RADEON_POD_STATE" ]; then
-            tools/run_radeon_controller_container.sh recover \
-              python -u tools/run_radeon_pod_notebooks.py \
-              --cleanup-state \
-              --state-file "$RADEON_POD_STATE"
-          fi
-
       - name: Execute notebook CI
         env:
           INPUT_FILTER: ${{ github.event.inputs.filter }}
@@ -147,7 +135,7 @@ jobs:
           RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}
         run: |
           cleanup_status=0
-          for suffix in tests recover execute cleanup; do
+          for suffix in tests execute cleanup; do
             docker rm -f \
               "${RADEON_CONTROLLER_NAME}-${suffix}" 2>/dev/null || true
           done
