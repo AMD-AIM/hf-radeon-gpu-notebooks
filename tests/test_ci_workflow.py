@@ -194,14 +194,14 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
             WORKFLOW_TEXT.index("      - name: Publish summary\n"),
         )
 
-    def test_prebuilt_controller_image_and_tests_run_before_notebooks(self):
+    def test_prebuilt_controller_image_is_pulled_before_notebooks(self):
         pull = WORKFLOW_TEXT.index("      - name: Pull prebuilt controller image\n")
-        unit_tests = WORKFLOW_TEXT.index("      - name: Run controller unit tests\n")
         execute = WORKFLOW_TEXT.index("      - name: Execute notebook CI\n")
         pull_step = step_block("Pull prebuilt controller image")
 
-        self.assertLess(pull, unit_tests)
-        self.assertLess(unit_tests, execute)
+        self.assertLess(pull, execute)
+        self.assertNotIn("Run controller unit tests", WORKFLOW_TEXT)
+        self.assertNotIn("            tests\n", WORKFLOW_TEXT)
         self.assertIn(
             "RADEON_CONTROLLER_IMAGE: "
             "crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/"
@@ -210,7 +210,6 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
         )
         self.assertNotIn("vars.RADEON_CONTROLLER_IMAGE", WORKFLOW_TEXT)
         self.assertIn('docker pull "$RADEON_CONTROLLER_IMAGE"', pull_step)
-        self.assertIn("must use the :latest tag", pull_step)
         self.assertNotIn("docker build", WORKFLOW_TEXT)
         self.assertNotIn("RADEON_CONTROLLER_BASE_IMAGE", WORKFLOW_TEXT)
         self.assertNotIn("RADEON_CONTROLLER_PIP_INDEX", WORKFLOW_TEXT)

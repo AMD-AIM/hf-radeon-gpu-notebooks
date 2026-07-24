@@ -36,6 +36,10 @@ DEFAULT_HF_ENDPOINT = "http://134.199.133.77"
 STATE_FILE = Path(".radeon-pod-ci-state.json")
 CELL_EXECUTION_ATTEMPTS = 3
 KERNEL_SESSION_ATTEMPTS = 3
+REMOTE_INFERENCE_HEADING_RE = re.compile(
+    r"(?im)^\s*##\s+Remote Inference via Inference Providers\b"
+)
+MARKDOWN_SECTION_HEADING_RE = re.compile(r"(?im)^\s*##\s+")
 
 
 class RadeonPodError(RuntimeError):
@@ -862,6 +866,30 @@ def close_kernel_session(
     return None
 
 
+def local_inference_code_cell_indexes(
+    notebook: dict[str, Any],
+) -> tuple[list[int], list[int]]:
+    """Select code cells outside optional remote inference sections."""
+    selected: list[int] = []
+    skipped: list[int] = []
+    in_remote_section = False
+    for index, cell in enumerate(notebook.get("cells", [])):
+        if cell.get("cell_type") == "markdown":
+            source = "".join(cell.get("source", []))
+            if REMOTE_INFERENCE_HEADING_RE.search(source):
+                in_remote_section = True
+            elif in_remote_section and MARKDOWN_SECTION_HEADING_RE.search(source):
+                in_remote_section = False
+            continue
+        if cell.get("cell_type") != "code":
+            continue
+        if in_remote_section:
+            skipped.append(index)
+        else:
+            selected.append(index)
+    return selected, skipped
+
+
 def execute_remote_notebook(
     jupyter: JupyterClient,
     remote_path: str,
@@ -873,11 +901,11 @@ def execute_remote_notebook(
     # notebook is neither normalized nor overwritten through the Contents API.
     notebook = copy.deepcopy(cloud_notebook)
 
-    code_cell_indexes = [
-        index
-        for index, cell in enumerate(notebook.get("cells", []))
-        if cell.get("cell_type") == "code"
-    ]
+    code_cell_indexes, skipped_remote_indexes = local_inference_code_cell_indexes(
+        notebook
+    )
+    if skipped_remote_indexes:
+        emit(f"# skipped_remote_inference_code_cells={len(skipped_remote_indexes)}")
     attempts_by_cell = {index: 0 for index in code_cell_indexes}
     if not code_cell_indexes:
         return RemoteExecution(

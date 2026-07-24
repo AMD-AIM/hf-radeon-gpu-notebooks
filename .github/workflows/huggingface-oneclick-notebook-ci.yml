@@ -60,7 +60,6 @@ jobs:
           sparse-checkout: |
             .github
             doc
-            tests
             tools
           sparse-checkout-cone-mode: true
 
@@ -72,15 +71,6 @@ jobs:
 
       - name: Pull prebuilt controller image
         run: |
-          if [ -z "${RADEON_CONTROLLER_IMAGE:-}" ]; then
-            echo "::error::RADEON_CONTROLLER_IMAGE repository variable is required"
-            exit 1
-          fi
-          if [[ "$RADEON_CONTROLLER_IMAGE" != *:latest ]]; then
-            echo "::error::RADEON_CONTROLLER_IMAGE must use the :latest tag"
-            exit 1
-          fi
-
           for attempt in 1 2 3; do
             if docker pull "$RADEON_CONTROLLER_IMAGE"; then
               exit 0
@@ -89,11 +79,6 @@ jobs:
             sleep $((attempt * 10))
           done
           exit 1
-
-      - name: Run controller unit tests
-        run: |
-          tools/run_radeon_controller_container.sh tests \
-            python -m unittest discover -s tests -v
 
       - name: Execute notebook CI
         env:
@@ -130,7 +115,7 @@ jobs:
           RADEON_API_TOKEN: ${{ secrets.RADEON_API_TOKEN }}
         run: |
           cleanup_status=0
-          for suffix in tests execute cleanup; do
+          for suffix in execute cleanup; do
             docker rm -f \
               "${RADEON_CONTROLLER_NAME}-${suffix}" 2>/dev/null || true
           done

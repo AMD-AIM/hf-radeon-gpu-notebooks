@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import json
 import os
@@ -458,6 +459,33 @@ class SourcePolicyTests(unittest.TestCase):
 
         self.assertIs(result, cloud_notebook)
         request.assert_called_once_with("GET", "contents/folder/model.ipynb")
+
+    def test_remote_inference_section_is_skipped_without_mutating_notebook(self):
+        cloud_notebook = {
+            "cells": [
+                {"cell_type": "code", "source": "local_model()"},
+                {
+                    "cell_type": "markdown",
+                    "source": "## Remote Inference via Inference Providers",
+                },
+                {
+                    "cell_type": "code",
+                    "source": "HF_TOKEN = 'YOUR_TOKEN_HERE'",
+                },
+                {"cell_type": "code", "source": "from openai import OpenAI"},
+                {"cell_type": "markdown", "source": "## Another Local Section"},
+                {"cell_type": "code", "source": "local_tail()"},
+            ]
+        }
+        original = copy.deepcopy(cloud_notebook)
+
+        selected, skipped = RUNNER.local_inference_code_cell_indexes(
+            cloud_notebook
+        )
+
+        self.assertEqual(selected, [0, 5])
+        self.assertEqual(skipped, [2, 3])
+        self.assertEqual(cloud_notebook, original)
 
     def test_known_secrets_are_redacted_recursively_from_artifact_values(self):
         secret = "hf_example_secret_value"
