@@ -146,6 +146,20 @@ class WorkflowFailureHandlingTests(unittest.TestCase):
         self.assertIn(checkout_guard, upload)
 
 
+class WorkflowIdentityTests(unittest.TestCase):
+    def test_workflow_identity_matches_local_machine_branch(self):
+        self.assertTrue(
+            WORKFLOW_TEXT.startswith(
+                "name: HF One-Click CI - Local Machine\n"
+                'run-name: "[Run] Local Machine CI"\n'
+            )
+        )
+        self.assertIn(
+            "  push:\n    branches: [hf_oneclick_local_machine]\n",
+            WORKFLOW_TEXT,
+        )
+
+
 class WorkflowCacheConfigurationTests(unittest.TestCase):
     def test_hf_and_transformers_use_the_same_model_cache(self):
         self.assertIn(

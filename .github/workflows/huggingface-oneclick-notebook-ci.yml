@@ -1,5 +1,5 @@
-name: Hugging Face One-Click Notebook CI
-run-name: "[Run] Workaround CI"
+name: HF One-Click CI - Local Machine
+run-name: "[Run] Local Machine CI"
 
 on:
   workflow_dispatch:
@@ -17,7 +17,7 @@ on:
           - "true"
           - "false"
   push:
-    branches: [main, "ci/**"]
+    branches: [hf_oneclick_local_machine]
 
 permissions:
   contents: write
