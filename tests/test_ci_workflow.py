@@ -150,7 +150,7 @@ class WorkflowIdentityTests(unittest.TestCase):
     def test_workflow_identity_matches_local_machine_branch(self):
         self.assertTrue(
             WORKFLOW_TEXT.startswith(
-                "name: HF One-Click CI - Local Machine\n"
+                "name: HF One-Click CI\n"
                 'run-name: "[Run] Local Machine CI"\n'
             )
         )

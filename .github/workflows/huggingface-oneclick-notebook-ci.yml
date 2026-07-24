@@ -1,4 +1,4 @@
-name: HF One-Click CI - Local Machine
+name: HF One-Click CI
 run-name: "[Run] Local Machine CI"
 
 on:
