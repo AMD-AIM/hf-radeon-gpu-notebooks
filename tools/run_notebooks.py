@@ -445,6 +445,10 @@ def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
         source = "".join(cell.get("source", []))
 
         clean_cell = dict(cell)
+        # Some generated Hugging Face notebooks contain the non-standard
+        # singular key "output". Preserve the downloaded snapshot verbatim,
+        # but do not send invalid notebook JSON to a kernel or artifact.
+        clean_cell.pop("output", None)
         metadata = dict(clean_cell.get("metadata") or {})
         metadata["ci_original_cell_index"] = original_index
         clean_cell["metadata"] = metadata
@@ -574,9 +578,28 @@ def format_download_tries(report: dict[str, Any]) -> str:
     cache_mode = str(
         report.get("hf_cache_mode") or os.environ.get("HF_CACHE_MODE", "")
     ).strip().lower()
-    if cache_mode == "runner":
+    if cache_mode == "runner" or report.get("download_status") == "IN_NOTEBOOK":
         return "\\"
     return str(report.get("download_attempts", 0))
+
+
+def format_download_duration(report: dict[str, Any]) -> str:
+    if report.get("download_status") == "IN_NOTEBOOK":
+        return "in notebook"
+    return format_duration(report.get("download_elapsed_seconds"))
+
+
+def format_vram(report: dict[str, Any], include_budget: bool = False) -> str:
+    peak = report.get("vram_peak_gb")
+    if peak is None:
+        return "n/a"
+    if not include_budget:
+        return f"{peak} GB"
+    numeric_peak = float(peak)
+    return (
+        f"{numeric_peak} / {VRAM_BUDGET_GB:.0f} GB "
+        f"({100.0 * numeric_peak / VRAM_BUDGET_GB:.0f}%)"
+    )
 
 
 def core_error(report: dict[str, Any]) -> str:
@@ -673,16 +696,16 @@ def write_progress(
 
     if reports:
         lines += [
-            "| # | Mode | Status | Model | Download | Peak VRAM | GPU util avg/peak | Total | Log |",
-            "|--:|:----:|:------:|:------|---------:|:---------:|:-----------------:|------:|:----|",
+            "| # | Mode | Status | Model | Download | Cell retries | Peak VRAM | GPU util avg/peak | Total | Log |",
+            "|--:|:----:|:------:|:------|---------:|-------------:|:---------:|:-----------------:|------:|:----|",
         ]
         for index, report in enumerate(reports, 1):
             lines.append(
                 f"| {index} | {report['mode']} | {report['overall_status']} | "
                 f"`{report['model_id']}` | "
-                f"{format_duration(report.get('download_elapsed_seconds'))} "
-                f"({report.get('download_attempts', 0)}x) | "
-                f"{report['vram_peak_gb']} GB | "
+                f"{format_download_duration(report)} | "
+                f"{report.get('cell_execution_retries', 0)} | "
+                f"{format_vram(report)} | "
                 f"{format_pct(report.get('gpu_util_avg_pct'))}/"
                 f"{format_pct(report.get('gpu_util_peak_pct'))} | "
                 f"{format_duration(report['elapsed_seconds'])} | {report['log_file']} |"
@@ -753,17 +776,17 @@ def write_summary(
             f"{sum(r['overall_status'] == 'FAILED' for r in reports)} FAIL / "
             f"{sum(r['overall_status'] == 'ERROR' for r in reports)} ERROR**",
             "",
-            "| # | Status | Model | Download | Model Download Tries | Cells P/F/T | Peak VRAM | GPU util avg/peak | Total | Core error |",
-            "|--:|:------:|:------|---------:|------:|:-----------:|:---------:|:-----------------:|------:|:-----------|",
+            "| # | Status | Model | Download | Model Download Tries | Cell Retries | Cells P/F/T | Peak VRAM | GPU util avg/peak | Total | Core error |",
+            "|--:|:------:|:------|---------:|------:|-------------:|:-----------:|:---------:|:-----------------:|------:|:-----------|",
         ]
         for index, report in enumerate(reports, 1):
-            peak = report["vram_peak_gb"]
-            vram = f"{peak} / {VRAM_BUDGET_GB:.0f} GB ({100.0 * peak / VRAM_BUDGET_GB:.0f}%)"
+            vram = format_vram(report, include_budget=True)
             lines.append(
                 f"| {index} | {icon[report['overall_status']]} | "
                 f"`{report['model_id']}` | "
-                f"{format_duration(report.get('download_elapsed_seconds'))} | "
+                f"{format_download_duration(report)} | "
                 f"{format_download_tries(report)} | "
+                f"{report.get('cell_execution_retries', 0)} | "
                 f"{report['cells_passed']}/{report['cells_failed']}/{report['cells_total']} | "
                 f"{vram} | "
                 f"{format_pct(report.get('gpu_util_avg_pct'))}/"
@@ -800,6 +823,7 @@ def build_artifact_notebook(original: dict[str, Any], executed: dict[str, Any]) 
             artifact_cells.append(cell)
             continue
 
+        cell.pop("output", None)
         executed_cell = executed_by_original_index.get(original_index)
         if executed_cell is None and fallback_index < len(fallback_cells):
             executed_cell = fallback_cells[fallback_index]

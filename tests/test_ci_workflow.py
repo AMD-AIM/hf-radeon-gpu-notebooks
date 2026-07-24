@@ -146,19 +146,71 @@ class WorkflowFailureHandlingTests(unittest.TestCase):
         self.assertIn(checkout_guard, upload)
 
 
-class WorkflowCacheConfigurationTests(unittest.TestCase):
-    def test_hf_and_transformers_use_the_same_model_cache(self):
+class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
+    def test_workflow_identity_matches_radeon_global_branch(self):
+        self.assertTrue(
+            WORKFLOW_TEXT.startswith(
+                "name: HF One-Click CI - Radeon Global\n"
+                'run-name: "[Run] Radeon Global CI"\n'
+            )
+        )
         self.assertIn(
-            'HF_CACHE_ROOT="/tmp/huggingface_cache/'
-            '${{ github.run_id }}-${{ github.run_attempt }}"',
+            "  push:\n    branches: [hf_oneclick_radeon_global]\n",
             WORKFLOW_TEXT,
         )
-        self.assertIn('-e HF_HUB_CACHE="$HF_CACHE_ROOT/hub"', WORKFLOW_TEXT)
-        self.assertIn('-e TRANSFORMERS_CACHE="$HF_CACHE_ROOT/hub"', WORKFLOW_TEXT)
-        self.assertNotIn(
-            'TRANSFORMERS_CACHE="$HF_CACHE_ROOT/transformers"',
-            WORKFLOW_TEXT,
+
+    def test_self_hosted_runner_is_only_a_long_running_pod_controller(self):
+        execute = step_block("Execute notebook CI")
+
+        self.assertIn("    runs-on: [self-hosted, rocm, w7900]", WORKFLOW_TEXT)
+        self.assertIn("does not use this runner's GPU, Docker", WORKFLOW_TEXT)
+        self.assertIn("tools/run_radeon_pod_notebooks.py", execute)
+        self.assertIn("RADEON_API_TOKEN: ${{ secrets.RADEON_API_TOKEN }}", execute)
+        self.assertIn("RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}", execute)
+        self.assertNotIn("docker run", WORKFLOW_TEXT)
+        self.assertNotIn("select_idle_rocm_gpu.py", WORKFLOW_TEXT)
+        self.assertNotIn("/dev/kfd", WORKFLOW_TEXT)
+        self.assertNotIn("/disk/ssd2/huggingface_cache", WORKFLOW_TEXT)
+        self.assertNotIn("use_runner_hf_cache", WORKFLOW_TEXT)
+
+    def test_owned_pod_cleanup_runs_even_after_failure(self):
+        cleanup = step_block("Ensure owned Radeon Pod is deleted")
+
+        self.assertIn("        if: always()", cleanup)
+        self.assertIn("--cleanup-state", cleanup)
+        self.assertIn('--state-file "$RADEON_POD_STATE"', cleanup)
+        self.assertNotIn("results/", cleanup)
+        self.assertLess(
+            WORKFLOW_TEXT.index("      - name: Ensure owned Radeon Pod is deleted\n"),
+            WORKFLOW_TEXT.index("      - name: Sync downloaded notebook snapshots\n"),
         )
+
+    def test_controller_dependencies_and_tests_run_before_notebooks(self):
+        install = WORKFLOW_TEXT.index("      - name: Install controller dependencies\n")
+        unit_tests = WORKFLOW_TEXT.index("      - name: Run controller unit tests\n")
+        execute = WORKFLOW_TEXT.index("      - name: Execute notebook CI\n")
+
+        self.assertLess(install, unit_tests)
+        self.assertLess(unit_tests, execute)
+        self.assertIn(
+            "-r tools/requirements-radeon-pod-ci.txt",
+            step_block("Install controller dependencies"),
+        )
+        self.assertIn(
+            '>> "$GITHUB_ENV"',
+            step_block("Install controller dependencies"),
+        )
+
+    def test_models_are_processed_strictly_serially(self):
+        controller = (REPO / "tools" / "run_radeon_pod_notebooks.py").read_text()
+
+        self.assertIn("    for target in targets:\n", controller)
+        self.assertIn(
+            "        report = run_one(target, args, results_dir, client)\n",
+            controller,
+        )
+        self.assertNotIn("matrix:", WORKFLOW_TEXT)
+        self.assertNotIn("strategy:", WORKFLOW_TEXT)
 
 
 class WorkflowGitTransportTests(unittest.TestCase):

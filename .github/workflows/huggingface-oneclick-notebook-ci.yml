@@ -1,5 +1,5 @@
-name: Hugging Face One-Click Notebook CI
-run-name: "[Run] Workaround CI"
+name: HF One-Click CI - Radeon Global
+run-name: "[Run] Radeon Global CI"
 
 on:
   workflow_dispatch:
@@ -8,16 +8,8 @@ on:
         description: "Substring filter on model id / notebook name (blank = all)"
         required: false
         default: ""
-      use_runner_hf_cache:
-        description: "Use the runner-local Hugging Face cache mounted from /disk/ssd2/huggingface_cache"
-        required: false
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
   push:
-    branches: [main, "ci/**"]
+    branches: [hf_oneclick_radeon_global]
 
 permissions:
   contents: write
@@ -28,11 +20,15 @@ concurrency:
 
 jobs:
   run-notebooks:
+    # The controller keeps the existing long-running self-hosted budget, but
+    # does not use this runner's GPU, Docker, or Hugging Face model cache.
     runs-on: [self-hosted, rocm, w7900]
     timeout-minutes: 2880
     env:
-      CI_CONTAINER: hf-ci-oneclick-${{ github.run_id }}
-      HF_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260711_workaround_fix_torch_streaming
+      HF_ENDPOINT: http://134.199.133.77
+      RADEON_NOTEBOOK_API: https://radeon-global.anruicloud.com/api/huggingface/notebooks
+      RADEON_POD_IMAGE: 10.5.10.12:1808/radeon-cloud-global/huaggingface_for_amd_radeon:20260711_workaround_fix_torch_streaming
+      RADEON_POD_STATE: .radeon-pod-ci-state.json
 
     steps:
       - name: Clear stale run outputs
@@ -46,8 +42,8 @@ jobs:
       - name: Checkout target revision
         id: checkout
         timeout-minutes: 15
-        # Rewrite GitHub fetches only for this step. The proxy receives no GitHub
-        # credential, and later authenticated pull/push commands keep the direct origin.
+        # This runner is in mainland China. Scope the read-only proxy rewrite
+        # to checkout; authenticated pull/push later keep their existing policy.
         env:
           GIT_CONFIG_COUNT: "1"
           GIT_CONFIG_KEY_0: "url.https://gh-test.anruicloud.com/.insteadOf"
@@ -61,6 +57,7 @@ jobs:
             .github
             doc
             original_notebooks
+            tests
             tools
           sparse-checkout-cone-mode: true
 
@@ -69,93 +66,78 @@ jobs:
           git checkout -f "${{ github.sha }}"
           git log --oneline -1
 
-      - name: Clean up stale CI containers
+      - name: Install controller dependencies
         run: |
-          docker ps -aq --filter "name=hf-ci-oneclick-" | xargs -r docker rm -f
+          CONTROLLER_VENV="$RUNNER_TEMP/hf-radeon-pod-controller-${{ github.run_id }}"
+          echo "CONTROLLER_VENV=$CONTROLLER_VENV" >> "$GITHUB_ENV"
+          python3 -m venv "$CONTROLLER_VENV"
+          "$CONTROLLER_VENV/bin/python" -m pip install --disable-pip-version-check \
+            -r tools/requirements-radeon-pod-ci.txt
 
-      - name: Select idle Radeon GPU
-        id: select_gpu
+      - name: Run controller unit tests
         run: |
-          python3 tools/select_idle_rocm_gpu.py \
-            --max-used-gb "${RADEON_CI_GPU_MAX_USED_GB:-2}" \
-            --max-util-pct "${RADEON_CI_GPU_MAX_UTIL_PCT:-5}" \
-            --wait-seconds "${RADEON_CI_GPU_WAIT_SECONDS:-3600}" \
-            --poll-seconds "${RADEON_CI_GPU_POLL_SECONDS:-30}" \
-            --github-output "$GITHUB_OUTPUT"
+          "$CONTROLLER_VENV/bin/python" -m unittest discover -s tests -v
+
+      - name: Recover owned Pod from an interrupted run
+        env:
+          RADEON_API_TOKEN: ${{ secrets.RADEON_API_TOKEN }}
+          RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}
+        run: |
+          if [ -f "$RADEON_POD_STATE" ]; then
+            "$CONTROLLER_VENV/bin/python" -u tools/run_radeon_pod_notebooks.py \
+              --cleanup-state \
+              --state-file "$RADEON_POD_STATE"
+          fi
 
       - name: Execute notebook CI
         env:
           INPUT_FILTER: ${{ github.event.inputs.filter }}
-          INPUT_USE_RUNNER_HF_CACHE: ${{ github.event.inputs.use_runner_hf_cache }}
-          HF_ONECLICK_TOKEN: ${{ secrets.HF_ONECLICK_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_ONECLICK_TOKEN }}
+          RADEON_API_TOKEN: ${{ secrets.RADEON_API_TOKEN }}
+          RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}
         run: |
           rm -rf results
           mkdir -p results
 
           FILTER="${INPUT_FILTER:-}"
-          if [ -z "${HF_ONECLICK_TOKEN:-}" ]; then
+          if [ -z "${HF_TOKEN:-}" ]; then
             echo "::error::HF_ONECLICK_TOKEN secret is required for this token-enabled branch"
             exit 1
           fi
-
-          SELECTED_RENDER_NODE="${{ steps.select_gpu.outputs.render_node }}"
-          if [ -z "$SELECTED_RENDER_NODE" ]; then
-            echo "::error::Select idle Radeon GPU did not produce a render node"
+          if [ -z "${RADEON_API_TOKEN:-}" ]; then
+            echo "::error::RADEON_API_TOKEN secret is required"
+            exit 1
+          fi
+          if [ -z "${RADEON_USER_NAME:-}" ]; then
+            echo "::error::RADEON_USER_NAME repository variable is required"
             exit 1
           fi
 
-          USE_RUNNER_HF_CACHE="${INPUT_USE_RUNNER_HF_CACHE:-true}"
-          case "$USE_RUNNER_HF_CACHE" in
-            true|1|yes|y)
-              HF_CACHE_MODE="runner"
-              HF_CACHE_ROOT=/disk/ssd2/huggingface_cache
-              mkdir -p "$HF_CACHE_ROOT/hub" "$HF_CACHE_ROOT/datasets"
-              ;;
-            false|0|no|n)
-              HF_CACHE_MODE="container"
-              HF_CACHE_ROOT="/tmp/huggingface_cache/${{ github.run_id }}-${{ github.run_attempt }}"
-              ;;
-            *)
-              echo "::error::use_runner_hf_cache must be true or false, got: $USE_RUNNER_HF_CACHE"
-              exit 1
-              ;;
-          esac
+          args=(
+            --results-dir results
+            --target-file doc/ci_target_models.csv
+            --state-file "$RADEON_POD_STATE"
+            --fail-on none
+          )
+          if [ -n "$FILTER" ]; then args+=(--filter "$FILTER"); fi
+          "$CONTROLLER_VENV/bin/python" -u \
+            tools/run_radeon_pod_notebooks.py "${args[@]}"
 
-          echo "Selected Radeon GPU: card=${{ steps.select_gpu.outputs.card_index }} render=$SELECTED_RENDER_NODE pci=${{ steps.select_gpu.outputs.pci_bus }}"
-          echo "Hugging Face cache mode: $HF_CACHE_MODE ($HF_CACHE_ROOT)"
-          docker run --rm \
-            --name "$CI_CONTAINER" \
-            --device=/dev/kfd \
-            --device="$SELECTED_RENDER_NODE" \
-            --group-add 44 --group-add 993 \
-            --security-opt seccomp=unconfined \
-            --ipc=host --shm-size 32g \
-            -v /disk/ssd2:/disk/ssd2 \
-            -v "$PWD":/workspace -w /workspace \
-            -e HF_ENDPOINT=http://134.199.133.77 \
-            -e HF_HUB_DISABLE_XET=1 \
-            -e HF_TOKEN="$HF_ONECLICK_TOKEN" \
-            -e HUGGING_FACE_HUB_TOKEN="$HF_ONECLICK_TOKEN" \
-            -e HUGGINGFACEHUB_API_TOKEN="$HF_ONECLICK_TOKEN" \
-            -e HF_HOME="$HF_CACHE_ROOT" \
-            -e HF_HUB_CACHE="$HF_CACHE_ROOT/hub" \
-            -e HF_DATASETS_CACHE="$HF_CACHE_ROOT/datasets" \
-            -e TRANSFORMERS_CACHE="$HF_CACHE_ROOT/hub" \
-            -e HF_CACHE_MODE="$HF_CACHE_MODE" \
-            -e CI_FILTER="$FILTER" \
-            -e RADEON_CI_RENDER_NODE="$SELECTED_RENDER_NODE" \
-            -e RADEON_CI_GPU_CARD="${{ steps.select_gpu.outputs.card_index }}" \
-            -e RADEON_CI_GPU_PCI_BUS="${{ steps.select_gpu.outputs.pci_bus }}" \
-            -e PYTHONUNBUFFERED=1 \
-            --entrypoint /bin/bash \
-            "$HF_CI_IMAGE" \
-            -lc 'args=(
-                  --results-dir results
-                  --target-file doc/ci_target_models.csv
-                  --fail-on none
-                )
-                if [ -n "$CI_FILTER" ]; then args+=(--filter "$CI_FILTER"); fi
-                python3 -u tools/run_notebooks.py "${args[@]}"'
+      - name: Ensure owned Radeon Pod is deleted
+        if: always()
+        env:
+          RADEON_API_TOKEN: ${{ secrets.RADEON_API_TOKEN }}
+          RADEON_USER_NAME: ${{ vars.RADEON_USER_NAME }}
+        run: |
+          if [ -f "$RADEON_POD_STATE" ]; then
+            PYTHON="${CONTROLLER_VENV:-}/bin/python"
+            if [ -z "${CONTROLLER_VENV:-}" ] || [ ! -x "$PYTHON" ]; then
+              PYTHON=python3
+            fi
+            "$PYTHON" -u tools/run_radeon_pod_notebooks.py \
+              --cleanup-state \
+              --state-file "$RADEON_POD_STATE"
+          fi
 
       - name: Sync downloaded notebook snapshots
         if: always() && steps.checkout.outcome == 'success' && startsWith(github.ref, 'refs/heads/')
@@ -207,13 +189,6 @@ jobs:
             echo "::warning::Could not push downloaded notebook snapshot update; leaving CI result unchanged."
             exit 0
           fi
-
-      - name: Tear down CI container
-        if: always()
-        run: |
-          docker rm -f "$CI_CONTAINER" 2>/dev/null || true
-          LOCK_FILE="${{ steps.select_gpu.outputs.lock_file }}"
-          if [ -n "$LOCK_FILE" ]; then rm -f "$LOCK_FILE"; fi
 
       - name: Publish summary
         if: always()
