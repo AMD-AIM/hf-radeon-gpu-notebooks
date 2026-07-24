@@ -22,6 +22,26 @@ sys.modules[SPEC.name] = RUNNER
 SPEC.loader.exec_module(RUNNER)
 
 
+def code_cell(source: str, **values):
+    return {
+        "cell_type": "code",
+        "metadata": {},
+        "execution_count": None,
+        "outputs": [],
+        "source": source,
+        **values,
+    }
+
+
+def notebook_document(*cells, metadata=None):
+    return {
+        "cells": list(cells),
+        "metadata": metadata or {},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+
+
 @contextmanager
 def fake_notebook_modules(events: list[str]):
     nbformat = types.ModuleType("nbformat")
@@ -135,6 +155,93 @@ class ModelDownloadTests(unittest.TestCase):
                 [str(cache_dir)] * 3,
             )
 
+    def test_runner_cache_skips_proactive_hf_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            environment = {
+                "HF_CACHE_MODE": "runner",
+                "HF_HUB_CACHE": str(Path(directory) / "hub"),
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(RUNNER, "download_model") as download,
+            ):
+                result = RUNNER.prepare_model("org/model")
+
+        download.assert_not_called()
+        self.assertEqual(result["status"], "PASSED")
+        self.assertEqual(result["attempts"], 0)
+        self.assertEqual(result["elapsed_seconds"], 0.0)
+
+    def test_non_runner_cache_keeps_proactive_hf_download(self):
+        expected = {
+            "status": "PASSED",
+            "attempts": 1,
+            "elapsed_seconds": 2.0,
+            "cache_path": "/cache/hub",
+            "error": None,
+        }
+        with (
+            mock.patch.dict(os.environ, {"HF_CACHE_MODE": "container"}, clear=False),
+            mock.patch.object(RUNNER, "download_model", return_value=expected) as download,
+        ):
+            result = RUNNER.prepare_model("org/model")
+
+        download.assert_called_once_with("org/model", log=None)
+        self.assertIs(result, expected)
+
+
+class NotebookNormalizationTests(unittest.TestCase):
+    def test_only_remote_inference_section_is_removed_from_notebook_code(self):
+        local_before = "print('local before')"
+        local_after = "print('local after')"
+        remote_code = "print('remote provider call')"
+        notebook = notebook_document(
+            {"cell_type": "markdown", "metadata": {}, "source": "# Example"},
+            code_cell(
+                local_before,
+                execution_count=9,
+                outputs=[{"output_type": "stream", "name": "stdout", "text": "old"}],
+            ),
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": "## Remote Inference via Inference Providers",
+            },
+            code_cell(remote_code),
+            {"cell_type": "markdown", "metadata": {}, "source": "## Local inference"},
+            code_cell(local_after),
+            metadata={"kernelspec": {"name": "python3"}},
+        )
+
+        normalized = RUNNER.normalize_notebook(notebook)
+        normalized_code = [
+            cell
+            for cell in normalized["cells"]
+            if cell.get("cell_type") == "code"
+        ]
+
+        self.assertEqual(
+            ["".join(cell.get("source", [])) for cell in normalized_code],
+            [local_before, local_after],
+        )
+        self.assertEqual(
+            normalized["metadata"]["kernelspec"],
+            notebook["metadata"]["kernelspec"],
+        )
+        normalized_code[0]["outputs"] = [
+            {"output_type": "stream", "name": "stdout", "text": "fresh"}
+        ]
+        normalized_code[0]["execution_count"] = 1
+        artifact = RUNNER.build_artifact_notebook(notebook, normalized)
+        artifact_code = [
+            cell for cell in artifact["cells"] if cell.get("cell_type") == "code"
+        ]
+        self.assertEqual(
+            ["".join(cell.get("source", [])) for cell in artifact_code],
+            [local_before, local_after],
+        )
+        self.assertEqual(artifact_code[0]["outputs"][0]["text"], "fresh")
+
 
 class SummaryTests(unittest.TestCase):
     def report(self, model_id: str, cache_mode: str, attempts: int, elapsed: float):
@@ -185,20 +292,7 @@ class ModelJobTests(unittest.TestCase):
         return RUNNER.Target(model_id="org/model", notebook="org__model.ipynb")
 
     def notebook(self):
-        return {
-            "cells": [
-                {
-                    "cell_type": "code",
-                    "metadata": {},
-                    "execution_count": None,
-                    "outputs": [],
-                    "source": "print('ok')",
-                }
-            ],
-            "metadata": {},
-            "nbformat": 4,
-            "nbformat_minor": 5,
-        }
+        return notebook_document(code_cell("print('ok')"))
 
     def test_order_and_total_timer_cover_download_through_nbclient(self):
         events: list[str] = []

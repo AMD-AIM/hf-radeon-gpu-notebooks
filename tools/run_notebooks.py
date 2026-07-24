@@ -36,42 +36,6 @@ LOADED_ENV: dict[str, str] = {}
 SECRET_VALUES: set[str] = set()
 
 
-GPU_PREAMBLE = '''# [ci-normalize] prefer GPU placement for HF helpers.
-import functools as _ci_functools
-import transformers as _ci_transformers
-
-_ci_original_pipeline = _ci_transformers.pipeline
-def _ci_pipeline(*args, **kwargs):
-    kwargs.setdefault("device_map", "auto")
-    return _ci_original_pipeline(*args, **kwargs)
-_ci_transformers.pipeline = _ci_pipeline
-
-for _ci_name in (
-    "AutoModel",
-    "AutoModelForCausalLM",
-    "AutoModelForImageTextToText",
-    "AutoModelForMultimodalLM",
-    "AutoModelForSeq2SeqLM",
-    "AutoModelForSpeechSeq2Seq",
-    "AutoModelForTokenClassification",
-):
-    _ci_cls = getattr(_ci_transformers, _ci_name, None)
-    if _ci_cls is None or not hasattr(_ci_cls, "from_pretrained"):
-        continue
-    _ci_original = _ci_cls.from_pretrained.__func__
-    def _ci_make_from_pretrained(original):
-        @classmethod
-        @_ci_functools.wraps(original)
-        def _ci_from_pretrained(cls, *args, **kwargs):
-            kwargs.setdefault("device_map", "auto")
-            kwargs.setdefault("torch_dtype", "auto")
-            return original(cls, *args, **kwargs)
-        return _ci_from_pretrained
-    _ci_cls.from_pretrained = _ci_make_from_pretrained(_ci_original)
-
-print("[ci-normalize] GPU placement defaults applied")
-'''
-
 REMOTE_INFERENCE_HEADING_RE = re.compile(
     r"(?im)^\s*##\s+Remote Inference via Inference Providers\b"
 )
@@ -423,15 +387,9 @@ def remote_section_decision(cell: dict[str, Any], in_remote_section: bool) -> tu
 def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(notebook)
     in_remote_section = False
-    cells: list[dict[str, Any]] = [
-        {
-            "cell_type": "code",
-            "metadata": {"ci_preamble": True},
-            "execution_count": None,
-            "outputs": [],
-            "source": GPU_PREAMBLE,
-        }
-    ]
+    # Preserve the downloaded notebook's executable code. The only source
+    # cells omitted by CI are those in the Remote Inference Providers section.
+    cells: list[dict[str, Any]] = []
 
     for original_index, cell in enumerate(normalized.get("cells", [])):
         drop_cell, in_remote_section = remote_section_decision(cell, in_remote_section)
@@ -442,19 +400,15 @@ def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
             cells.append(cell)
             continue
 
-        source = "".join(cell.get("source", []))
-
-        clean_cell = dict(cell)
-        metadata = dict(clean_cell.get("metadata") or {})
+        metadata = dict(cell.get("metadata") or {})
         metadata["ci_original_cell_index"] = original_index
-        clean_cell["metadata"] = metadata
-        clean_cell["source"] = source
-        clean_cell["outputs"] = []
-        clean_cell["execution_count"] = None
-        cells.append(clean_cell)
+        cell["metadata"] = metadata
+        cell["source"] = "".join(cell.get("source", []))
+        cell["outputs"] = []
+        cell["execution_count"] = None
+        cells.append(cell)
 
     normalized["cells"] = cells
-    normalized.get("metadata", {}).pop("kernelspec", None)
     return normalized
 
 
@@ -651,6 +605,30 @@ def download_model(
     }
 
 
+def prepare_model(
+    model_id: str,
+    log: Callable[[str], None] | None = None,
+) -> dict[str, Any]:
+    cache_mode = os.environ.get("HF_CACHE_MODE", "").strip().lower()
+    if cache_mode != "runner":
+        return download_model(model_id, log=log)
+
+    message = (
+        "[MODEL-DOWNLOAD] skipped proactive hf download: "
+        "using runner-local Hugging Face cache"
+    )
+    print(message, flush=True)
+    if log is not None:
+        log(message)
+    return {
+        "status": "PASSED",
+        "attempts": 0,
+        "elapsed_seconds": 0.0,
+        "cache_path": str(resolved_hf_hub_cache()),
+        "error": None,
+    }
+
+
 def write_progress(
     results_dir: Path,
     reports: list[dict[str, Any]],
@@ -778,19 +756,15 @@ def write_summary(
 def build_artifact_notebook(original: dict[str, Any], executed: dict[str, Any]) -> dict[str, Any]:
     artifact = copy.deepcopy(original)
     executed_by_original_index: dict[int, dict[str, Any]] = {}
-    fallback_cells: list[dict[str, Any]] = []
     for cell in executed.get("cells", []):
-        if cell.get("cell_type") != "code" or cell.get("metadata", {}).get("ci_preamble"):
+        if cell.get("cell_type") != "code":
             continue
         original_index = cell.get("metadata", {}).get("ci_original_cell_index")
         if isinstance(original_index, int):
             executed_by_original_index[original_index] = cell
-        else:
-            fallback_cells.append(cell)
 
     artifact_cells: list[dict[str, Any]] = []
     in_remote_section = False
-    fallback_index = 0
     for original_index, cell in enumerate(artifact.get("cells", [])):
         drop_cell, in_remote_section = remote_section_decision(cell, in_remote_section)
         if drop_cell:
@@ -801,10 +775,6 @@ def build_artifact_notebook(original: dict[str, Any], executed: dict[str, Any]) 
             continue
 
         executed_cell = executed_by_original_index.get(original_index)
-        if executed_cell is None and fallback_index < len(fallback_cells):
-            executed_cell = fallback_cells[fallback_index]
-            fallback_index += 1
-
         cell["outputs"] = []
         cell["execution_count"] = None
         if executed_cell is not None:
@@ -878,7 +848,7 @@ def run_one(
         emit(log, f"# timed_model_job_started {started_at}")
         emit(log, f"# model_cache={resolved_hf_hub_cache()}")
 
-        download = download_model(target.model_id, log=lambda line: emit(log, line))
+        download = prepare_model(target.model_id, log=lambda line: emit(log, line))
         if download["status"] != "PASSED":
             elapsed = round(time.monotonic() - started, 1)
             error = (
@@ -911,15 +881,11 @@ def run_one(
         emit(log, "# visible_gpus=0\n")
 
         def on_cell_start(cell: dict[str, Any], cell_index: int, **_: Any) -> None:
-            if cell.get("metadata", {}).get("ci_preamble"):
-                return
             emit(log, f"\n----- cell {cell_index} -----")
             emit(log, "".join(cell.get("source", [])).rstrip())
             emit(log, "----- output -----")
 
         def on_cell_executed(cell: dict[str, Any], cell_index: int, **_: Any) -> None:
-            if cell.get("metadata", {}).get("ci_preamble"):
-                return
             for output in cell.get("outputs", []):
                 kind = output.get("output_type")
                 if kind == "stream":
@@ -1061,7 +1027,7 @@ def collect_cell_results(notebook: dict[str, Any]) -> tuple[list[dict[str, Any]]
     passed = failed = 0
     index = 0
     for cell in notebook.get("cells", []):
-        if cell.get("cell_type") != "code" or cell.get("metadata", {}).get("ci_preamble"):
+        if cell.get("cell_type") != "code":
             continue
         index += 1
         error = next((o for o in cell.get("outputs", []) if o.get("output_type") == "error"), None)
@@ -1143,7 +1109,6 @@ def validate_plan(targets: list[Target]) -> list[str]:
             normalized = normalize_notebook(notebook)
             code_cells = sum(
                 cell.get("cell_type") == "code"
-                and not cell.get("metadata", {}).get("ci_preamble")
                 for cell in normalized.get("cells", [])
             )
             fetched = source.get("fetched_url") or source.get("source")
@@ -1213,7 +1178,8 @@ def main() -> None:
 
     policy = (
         f"source=hf-oneclick; fail_on={args.fail_on}; "
-        f"model_download='hf download MODEL_ID'; retries={MODEL_DOWNLOAD_ATTEMPTS}; "
+        "model_download='runner cache: notebook-native; otherwise: "
+        f"hf download MODEL_ID'; retries={MODEL_DOWNLOAD_ATTEMPTS}; "
         f"model_cache={model_cache}; timing=download-start-to-nbclient-end; "
         "notebook-preparation=excluded; "
         "single Radeon GPU"
@@ -1236,7 +1202,7 @@ def main() -> None:
             pending.remove(run_name)
         print(
             f"==> START {run_name} ({target.model_id}): "
-            "prepare (excluded) -> download -> notebook",
+            "prepare (excluded) -> runner cache or timed download -> notebook",
             flush=True,
         )
         write_progress(results_dir, reports, pending, running=run_name)
