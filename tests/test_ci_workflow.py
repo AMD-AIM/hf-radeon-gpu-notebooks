@@ -202,9 +202,12 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
         self.assertLess(pull, unit_tests)
         self.assertLess(unit_tests, execute)
         self.assertIn(
-            "RADEON_CONTROLLER_IMAGE: ${{ vars.RADEON_CONTROLLER_IMAGE }}",
+            "RADEON_CONTROLLER_IMAGE: "
+            "crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/"
+            "images_hana/hf-oneclick-radeon-global-controller:latest",
             WORKFLOW_TEXT,
         )
+        self.assertNotIn("vars.RADEON_CONTROLLER_IMAGE", WORKFLOW_TEXT)
         self.assertIn('docker pull "$RADEON_CONTROLLER_IMAGE"', pull_step)
         self.assertIn("must use the :latest tag", pull_step)
         self.assertNotIn("docker build", WORKFLOW_TEXT)
