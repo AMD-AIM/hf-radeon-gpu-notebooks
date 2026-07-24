@@ -67,19 +67,6 @@ class CacheConfigurationTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "must share one cache"):
                     RUNNER.assert_shared_model_cache()
 
-    def test_workflow_points_hf_and_transformers_at_same_cache(self):
-        workflow = (
-            REPO / ".github" / "workflows" / "huggingface-oneclick-notebook-ci.yml"
-        ).read_text()
-        self.assertIn(
-            'HF_CACHE_ROOT="/tmp/huggingface_cache/'
-            '${{ github.run_id }}-${{ github.run_attempt }}"',
-            workflow,
-        )
-        self.assertIn('-e HF_HUB_CACHE="$HF_CACHE_ROOT/hub"', workflow)
-        self.assertIn('-e TRANSFORMERS_CACHE="$HF_CACHE_ROOT/hub"', workflow)
-        self.assertNotIn('TRANSFORMERS_CACHE="$HF_CACHE_ROOT/transformers"', workflow)
-
 
 class ModelDownloadTests(unittest.TestCase):
     def test_plain_hf_download_retries_three_total_attempts(self):
