@@ -35,7 +35,16 @@ jobs:
       HF_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260711_workaround_fix_torch_streaming
 
     steps:
+      - name: Clear stale run outputs
+        run: |
+          if [ -z "${GITHUB_WORKSPACE:-}" ]; then
+            echo "::error::GITHUB_WORKSPACE is not set"
+            exit 1
+          fi
+          rm -rf -- "$GITHUB_WORKSPACE/results"
+
       - name: Checkout target revision
+        id: checkout
         timeout-minutes: 15
         uses: actions/checkout@v4
         with:
@@ -143,7 +152,7 @@ jobs:
                 python3 -u tools/run_notebooks.py "${args[@]}"'
 
       - name: Sync downloaded notebook snapshots
-        if: always() && startsWith(github.ref, 'refs/heads/')
+        if: always() && steps.checkout.outcome == 'success' && startsWith(github.ref, 'refs/heads/')
         run: |
           BRANCH="${GITHUB_REF_NAME}"
           if [ -z "$BRANCH" ]; then
@@ -196,10 +205,29 @@ jobs:
 
       - name: Publish summary
         if: always()
-        run: cat results/summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "no summary produced" >> "$GITHUB_STEP_SUMMARY"
+        env:
+          CHECKOUT_OUTCOME: ${{ steps.checkout.outcome }}
+        run: |
+          if [ -s results/summary.md ]; then
+            cat results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$CHECKOUT_OUTCOME" != "success" ]; then
+            {
+              echo "# Hugging Face One-Click Notebook CI - Results"
+              echo
+              echo "**Infrastructure failure: repository checkout did not complete.**"
+              echo
+              echo "Notebook execution did not start, so no current-run summary was produced."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            {
+              echo "# Hugging Face One-Click Notebook CI - Results"
+              echo
+              echo "**No current-run notebook summary was produced.**"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload results
-        if: always()
+        if: always() && steps.checkout.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: huggingface-oneclick-results-${{ github.run_id }}
