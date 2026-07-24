@@ -127,6 +127,34 @@ class WorkflowOutputIsolationTests(unittest.TestCase):
         self.assertIn(checkout_guard, sync)
         self.assertIn(checkout_guard, upload)
 
+    def test_checkout_proxy_is_step_scoped_and_keeps_direct_origin(self):
+        checkout = step_block("Checkout target revision")
+        job_prefix = WORKFLOW_TEXT[: WORKFLOW_TEXT.index(checkout)]
+
+        self.assertIn('GIT_CONFIG_COUNT: "1"', checkout)
+        self.assertIn(
+            'GIT_CONFIG_KEY_0: "url.https://gh-test.anruicloud.com/.insteadOf"',
+            checkout,
+        )
+        self.assertIn('GIT_CONFIG_VALUE_0: "https://github.com/"', checkout)
+        self.assertIn("persist-credentials: true", checkout)
+        self.assertNotIn("github-server-url:", checkout)
+        self.assertNotIn("GIT_CONFIG_KEY_0:", job_prefix)
+
+    def test_notebook_sync_pulls_via_proxy_but_pushes_directly(self):
+        sync = step_block("Sync downloaded notebook snapshots")
+
+        self.assertIn(
+            '"url.https://gh-test.anruicloud.com/.insteadOf=https://github.com/"',
+            sync,
+        )
+        self.assertIn(
+            'retry_git git_via_fetch_proxy pull --rebase origin "$BRANCH"',
+            sync,
+        )
+        self.assertIn('retry_git git push origin "HEAD:$BRANCH"', sync)
+        self.assertNotIn("git_via_fetch_proxy push", sync)
+
 
 if __name__ == "__main__":
     unittest.main()

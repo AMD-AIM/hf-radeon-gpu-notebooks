@@ -46,6 +46,12 @@ jobs:
       - name: Checkout target revision
         id: checkout
         timeout-minutes: 15
+        # Rewrite GitHub fetches only for this step. The proxy receives no GitHub
+        # credential, and later authenticated pull/push commands keep the direct origin.
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: "url.https://gh-test.anruicloud.com/.insteadOf"
+          GIT_CONFIG_VALUE_0: "https://github.com/"
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
@@ -187,7 +193,13 @@ jobs:
             return 1
           }
 
-          if ! retry_git git pull --rebase origin "$BRANCH"; then
+          git_via_fetch_proxy() {
+            git \
+              -c "url.https://gh-test.anruicloud.com/.insteadOf=https://github.com/" \
+              "$@"
+          }
+
+          if ! retry_git git_via_fetch_proxy pull --rebase origin "$BRANCH"; then
             echo "::warning::Could not rebase downloaded notebook snapshot update; leaving CI result unchanged."
             exit 0
           fi
