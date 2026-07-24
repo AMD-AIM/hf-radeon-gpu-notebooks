@@ -18,12 +18,14 @@ manually from the **Actions** tab, or use:
 gh workflow run huggingface-oneclick-notebook-ci.yml \
   --repo AMD-AIM/hf-radeon-gpu-notebooks \
   --ref main \
+  --field targets='["radeon-global","local-machine"]' \
   --field filter="" \
   --field use_runner_hf_cache=true
 ```
 
 The default branch retains only this guide and a minimal `workflow_dispatch`
 bridge because GitHub requires a manually dispatched workflow to exist on the
-default branch. The bridge dispatches `hf_oneclick_local_machine`; Radeon
-Global can be dispatched directly by selecting `hf_oneclick_radeon_global` in
-the Actions UI.
+default branch. The `targets` input is an ordered JSON array. By default, the
+bridge dispatches `hf_oneclick_radeon_global` first and
+`hf_oneclick_local_machine` second. A single target or the reverse order is
+also supported.

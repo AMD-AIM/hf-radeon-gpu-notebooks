@@ -1,9 +1,14 @@
-name: HF One-Click CI Dispatcher
+name: HF One-Click CI
 run-name: "[Dispatch] HF One-Click CI"
 
 on:
   workflow_dispatch:
     inputs:
+      targets:
+        description: 'Ordered JSON list containing "radeon-global" and/or "local-machine"'
+        required: false
+        default: '["radeon-global","local-machine"]'
+        type: string
       filter:
         description: "Forwarded substring filter (blank = all)"
         required: false
@@ -22,23 +27,70 @@ permissions:
   contents: read
 
 concurrency:
-  group: dispatch-hf-oneclick-local-machine
+  group: dispatch-hf-oneclick-ci
   cancel-in-progress: false
 
 jobs:
-  dispatch-local-machine:
+  dispatch-targets:
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch Local Machine CI
+      - name: Dispatch target CIs in order
         env:
           GH_TOKEN: ${{ github.token }}
+          INPUT_TARGETS: ${{ inputs.targets }}
           INPUT_FILTER: ${{ inputs.filter }}
           INPUT_USE_RUNNER_HF_CACHE: ${{ inputs.use_runner_hf_cache }}
-          TARGET_REF: hf_oneclick_local_machine
           TARGET_WORKFLOW: huggingface-oneclick-notebook-ci.yml
         run: |
-          gh workflow run "$TARGET_WORKFLOW" \
-            --repo "$GITHUB_REPOSITORY" \
-            --ref "$TARGET_REF" \
-            --field filter="$INPUT_FILTER" \
-            --field use_runner_hf_cache="$INPUT_USE_RUNNER_HF_CACHE"
+          TARGETS_JSON="${INPUT_TARGETS:-[\"radeon-global\",\"local-machine\"]}"
+          if ! TARGET_LINES="$(
+            python3 -c '
+          import json
+          import sys
+
+          try:
+              targets = json.loads(sys.argv[1])
+          except (json.JSONDecodeError, TypeError):
+              raise SystemExit(1)
+          allowed = {"radeon-global", "local-machine"}
+          if (
+              not isinstance(targets, list)
+              or not targets
+              or any(type(target) is not str or target not in allowed for target in targets)
+              or len(targets) != len(set(targets))
+          ):
+              raise SystemExit(1)
+          print(*targets, sep="\n")
+          ' "$TARGETS_JSON"
+          )"; then
+            echo "::error::targets must be a non-empty JSON array containing each of radeon-global and local-machine at most once"
+            exit 1
+          fi
+
+          mapfile -t TARGETS <<<"$TARGET_LINES"
+          for TARGET in "${TARGETS[@]}"; do
+            case "$TARGET" in
+              radeon-global)
+                TARGET_REF=hf_oneclick_radeon_global
+                ;;
+              local-machine)
+                TARGET_REF=hf_oneclick_local_machine
+                ;;
+            esac
+
+            ARGS=(
+              "$TARGET_WORKFLOW"
+              --repo "$GITHUB_REPOSITORY"
+              --ref "$TARGET_REF"
+              --field "filter=$INPUT_FILTER"
+            )
+            if [ "$TARGET" = "local-machine" ]; then
+              ARGS+=(
+                --field
+                "use_runner_hf_cache=$INPUT_USE_RUNNER_HF_CACHE"
+              )
+            fi
+
+            echo "Dispatching $TARGET to $TARGET_REF"
+            gh workflow run "${ARGS[@]}"
+          done
