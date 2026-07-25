@@ -149,7 +149,7 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
             hf_token="hf-secret-token",
         )
 
-    def test_create_uses_native_notebook_without_ignored_env_payload(self):
+    def test_create_uses_native_notebook_with_supported_payload(self):
         client = self.client()
         with (
             mock.patch.object(
@@ -163,7 +163,7 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
                 return_value={"status": "allocating"},
             ) as request,
         ):
-            client.create("org/model", 2)
+            client.create("org/model")
 
         payload = request.call_args.kwargs["payload"]
         self.assertEqual(
@@ -171,7 +171,7 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
             "https://huggingface.co/org/model.ipynb",
         )
         self.assertEqual(payload["image"], "registry/image:test")
-        self.assertEqual(payload["gpu_count"], 2)
+        self.assertEqual(payload["gpu_count"], 1)
         self.assertNotIn("env", payload)
 
     def test_create_refuses_to_replace_an_existing_user_pod(self):
@@ -529,41 +529,6 @@ class SourcePolicyTests(unittest.TestCase):
         self.assertNotIn(secret, str(redacted))
         self.assertIn("******", str(redacted))
 
-    def test_target_csv_can_request_more_resources_for_one_model(self):
-        with tempfile.TemporaryDirectory() as directory:
-            target_file = Path(directory) / "targets.csv"
-            target_file.write_text(
-                "model_id,notebook,enabled,gpu_count\n"
-                "org/small,small.ipynb,yes,1\n"
-                "org/large,large.ipynb,yes,2\n"
-            )
-
-            targets = RUNNER.common.load_targets(target_file)
-
-        self.assertEqual([target.gpu_count for target in targets], [1, 2])
-
-    def test_target_csv_rejects_invalid_gpu_count(self):
-        with tempfile.TemporaryDirectory() as directory:
-            target_file = Path(directory) / "targets.csv"
-            target_file.write_text(
-                "model_id,notebook,enabled,gpu_count\n"
-                "org/model,model.ipynb,yes,3\n"
-            )
-            with self.assertRaisesRegex(ValueError, "gpu_count must be 1, 2, or 4"):
-                RUNNER.common.load_targets(target_file)
-
-    def test_repository_targets_use_two_gpus_only_for_omni(self):
-        targets = RUNNER.common.load_targets(
-            REPO / "doc" / "ci_target_models.csv"
-        )
-        two_gpu = [target.model_id for target in targets if target.gpu_count == 2]
-
-        self.assertEqual(len(targets), 25)
-        self.assertEqual(two_gpu, ["Qwen/Qwen3-Omni-30B-A3B-Instruct"])
-        self.assertTrue(
-            all(target.gpu_count == 1 for target in targets[:-1])
-        )
-
     def test_kernel_runtime_is_configured_without_mutating_notebook(self):
         cloud_notebook = notebook("print('user cell')")
         original = copy.deepcopy(cloud_notebook)
@@ -596,18 +561,15 @@ class SourcePolicyTests(unittest.TestCase):
     def test_artifact_sanitization_drops_invalid_output_without_cloud_mutation(self):
         cloud_notebook = notebook("print('ok')")
         cloud_notebook["cells"][0]["output"] = {"nonstandard": True}
-        cloud_notebook["cells"][0]["outputs"] = [
-            {"output_type": "stream", "name": "stdout", "text": "ok\n"}
-        ]
+        cloud_notebook["cells"][0].pop("outputs")
+        cloud_notebook["cells"][0].pop("execution_count")
         original = copy.deepcopy(cloud_notebook)
 
         artifact = RUNNER.sanitize_artifact_notebook(cloud_notebook)
 
         self.assertNotIn("output", artifact["cells"][0])
-        self.assertEqual(
-            artifact["cells"][0]["outputs"],
-            original["cells"][0]["outputs"],
-        )
+        self.assertEqual(artifact["cells"][0]["outputs"], [])
+        self.assertIsNone(artifact["cells"][0]["execution_count"])
         self.assertEqual(cloud_notebook, original)
 
 
@@ -628,8 +590,8 @@ class PodSummaryTests(unittest.TestCase):
             RUNNER.common.write_summary(Path(directory), [report], "pod-policy")
             summary = (Path(directory) / "summary.md").read_text()
 
-        self.assertIn("| Model | GPUs | Download | Model Download Tries |", summary)
-        self.assertIn("`org/model` | 1 | in notebook | \\ | 2 |", summary)
+        self.assertIn("| Model | Download | Model Download Tries | Cell Retries |", summary)
+        self.assertIn("`org/model` | in notebook | \\ | 2 |", summary)
         self.assertIn("| 1/0/1 | 42s |", summary)
 
 

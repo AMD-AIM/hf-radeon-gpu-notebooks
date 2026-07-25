@@ -26,7 +26,6 @@ SECRET_VALUES: set[str] = set()
 class Target:
     model_id: str
     notebook: str
-    gpu_count: int = 1
 
 
 def utc_now() -> str:
@@ -69,19 +68,9 @@ def load_targets(path: Path, text_filter: str = "") -> list[Target]:
                 raise ValueError(
                     f"{path}:{line_number}: model_id and notebook are required"
                 )
-            try:
-                gpu_count = int((row.get("gpu_count") or "1").strip())
-            except ValueError:
-                raise ValueError(
-                    f"{path}:{line_number}: gpu_count must be 1, 2, or 4"
-                ) from None
-            if gpu_count not in {1, 2, 4}:
-                raise ValueError(
-                    f"{path}:{line_number}: gpu_count must be 1, 2, or 4"
-                )
             if needle and needle not in f"{model_id} {notebook}".lower():
                 continue
-            targets.append(Target(model_id, notebook, gpu_count))
+            targets.append(Target(model_id=model_id, notebook=notebook))
     return targets
 
 
@@ -151,7 +140,6 @@ def make_report(
     return {
         "mode": "radeon-pod",
         "model_id": target.model_id,
-        "gpu_count": target.gpu_count,
         "notebook": target.notebook,
         "artifact_notebook": artifact_name,
         "source": "radeon-global-managed",
@@ -194,14 +182,13 @@ def write_progress(
 
     if reports:
         lines += [
-            "| # | Status | Model | GPUs | Download | Cell retries | Total | Log |",
-            "|--:|:------:|:------|-----:|---------:|-------------:|------:|:----|",
+            "| # | Status | Model | Download | Cell retries | Total | Log |",
+            "|--:|:------:|:------|---------:|-------------:|------:|:----|",
         ]
         for index, report in enumerate(reports, 1):
             lines.append(
                 f"| {index} | {report['overall_status']} | "
-                f"`{report['model_id']}` | {report.get('gpu_count', 1)} | "
-                f"{format_download_duration(report)} | "
+                f"`{report['model_id']}` | {format_download_duration(report)} | "
                 f"{report.get('cell_execution_retries', 0)} | "
                 f"{format_duration(report['elapsed_seconds'])} | "
                 f"{report['log_file']} |"
@@ -259,16 +246,15 @@ def write_summary(
             "",
             "## Radeon Global Notebooks",
             "",
-            "| # | Status | Model | GPUs | Download | Model Download Tries | "
+            "| # | Status | Model | Download | Model Download Tries | "
             "Cell Retries | Cells P/F/T | Total | Core error |",
-            "|--:|:------:|:------|-----:|---------:|------:|-------------:|"
+            "|--:|:------:|:------|---------:|------:|-------------:|"
             ":-----------:|------:|:-----------|",
         ]
         for index, report in enumerate(reports, 1):
             lines.append(
                 f"| {index} | {icons[report['overall_status']]} | "
-                f"`{report['model_id']}` | {report.get('gpu_count', 1)} | "
-                f"{format_download_duration(report)} | "
+                f"`{report['model_id']}` | {format_download_duration(report)} | "
                 f"{format_download_tries(report)} | "
                 f"{report.get('cell_execution_retries', 0)} | "
                 f"{report['cells_passed']}/{report['cells_failed']}/"

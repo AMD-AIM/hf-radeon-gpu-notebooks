@@ -224,7 +224,7 @@ class RadeonPodClient:
             params={"user_name": self.user_name},
         )
 
-    def create(self, model_id: str, gpu_count: int = 1) -> dict[str, Any]:
+    def create(self, model_id: str) -> dict[str, Any]:
         current = self.current()
         status = response_status(current)
         if status != "not_found":
@@ -239,7 +239,7 @@ class RadeonPodClient:
             payload={
                 "user_name": self.user_name,
                 "notebook_path": f"https://huggingface.co/{model_id}.ipynb",
-                "gpu_count": gpu_count,
+                "gpu_count": 1,
                 "pod_type": "one-click",
                 "image": self.image,
                 "unlimited_credits": True,
@@ -1177,6 +1177,9 @@ def sanitize_artifact_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
     for cell in artifact.get("cells", []):
         if isinstance(cell, dict):
             cell.pop("output", None)
+            if cell.get("cell_type") == "code":
+                cell.setdefault("outputs", [])
+                cell.setdefault("execution_count", None)
     return artifact
 
 
@@ -1287,7 +1290,7 @@ def run_one(
 
         pod_setup_started = time.monotonic()
         try:
-            create_response = client.create(target.model_id, target.gpu_count)
+            create_response = client.create(target.model_id)
             pod_created = True
             created_instance_id = response_instance_id(create_response) or ""
             write_owned_state(
@@ -1334,8 +1337,7 @@ def run_one(
             pod_setup_elapsed = round(time.monotonic() - pod_setup_started, 3)
             emit(
                 f"# pod_setup={pod_setup_elapsed}s (excluded) "
-                f"instance_id={created_instance_id or 'unknown'} "
-                f"gpu_count={target.gpu_count}"
+                f"instance_id={created_instance_id or 'unknown'} gpu_count=1"
             )
             emit(f"# cloud_notebook={remote_path} (managed by Radeon Global)")
 
@@ -1453,8 +1455,7 @@ def validate_cloud_plan(targets: list[common.Target]) -> list[str]:
             continue
         print(
             f"[PLAN OK] radeon-pod {target.model_id:45} "
-            f"gpus={target.gpu_count} artifact={target.notebook:45} "
-            f"cloud_source={notebook_url}",
+            f"gpu=1 artifact={target.notebook:45} cloud_source={notebook_url}",
             flush=True,
         )
     return errors
@@ -1528,7 +1529,7 @@ def main() -> None:
         f"source=radeon-global-managed; fail_on={args.fail_on}; "
         "backend=radeon-pod; "
         "startup_current_pod_reset=true; "
-        "pod_per_model=true; gpu_count=target-configured; "
+        "pod_per_model=true; gpu_count=1; "
         "model_download=notebook-native; "
         f"cell_attempts={CELL_EXECUTION_ATTEMPTS}; "
         f"kernel_session_attempts={KERNEL_SESSION_ATTEMPTS}; "
@@ -1549,8 +1550,8 @@ def main() -> None:
         pending.remove(run_name)
         print(
             f"==> START {run_name} ({target.model_id}): "
-            f"create {target.gpu_count}-GPU Pod and use its cloud-managed "
-            "notebook (excluded) -> "
+            "create 1-GPU Pod and use its cloud-managed notebook "
+            "(excluded) -> "
             "notebook cells with retry (timed) -> delete Pod (excluded)",
             flush=True,
         )
