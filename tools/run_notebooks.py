@@ -1135,7 +1135,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fail-on",
         choices=["all", "none"],
-        default="none",
+        default="all",
         help="which failures should make the process exit non-zero",
     )
     parser.add_argument("--filter", default="")
@@ -1218,12 +1218,15 @@ def main() -> None:
 
     if args.fail_on == "none":
         return
+    expected = [target.model_id for target in targets]
+    actual = [report["model_id"] for report in reports]
     failing = [
         report
         for report in reports
         if report["overall_status"] != "PASSED"
     ]
-    if failing:
+    if actual != expected or failing:
+        print(f"\nCompleteness: expected={len(expected)}, reported={len(actual)}", flush=True)
         print(f"\nFailing CI because {len(failing)} {args.fail_on} job(s) did not pass:", flush=True)
         for report in failing:
             print(

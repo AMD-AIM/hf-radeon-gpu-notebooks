@@ -152,7 +152,7 @@ jobs:
             -lc 'args=(
                   --results-dir results
                   --target-file doc/ci_target_models.csv
-                  --fail-on none
+                  --fail-on all
                 )
                 if [ -n "$CI_FILTER" ]; then args+=(--filter "$CI_FILTER"); fi
                 python3 -u tools/run_notebooks.py "${args[@]}"'
