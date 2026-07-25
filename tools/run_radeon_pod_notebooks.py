@@ -56,6 +56,7 @@ class RemoteExecution:
     elapsed_seconds: float
     run_error: str | None
     attempts_by_cell: dict[int, int]
+    errors_by_cell: dict[int, str]
     kernel_session_attempts: int
     timed_started_at: str | None
     timed_finished_at: str | None
@@ -932,15 +933,17 @@ def execute_remote_notebook(
     if skipped_remote_indexes:
         emit(f"# skipped_remote_inference_code_cells={len(skipped_remote_indexes)}")
     attempts_by_cell = {index: 0 for index in code_cell_indexes}
+    errors_by_cell: dict[int, str] = {}
     if not code_cell_indexes:
         return RemoteExecution(
-            notebook,
-            0.0,
-            None,
-            attempts_by_cell,
-            0,
-            None,
-            None,
+            notebook=notebook,
+            elapsed_seconds=0.0,
+            run_error=None,
+            attempts_by_cell=attempts_by_cell,
+            errors_by_cell=errors_by_cell,
+            kernel_session_attempts=0,
+            timed_started_at=None,
+            timed_finished_at=None,
         )
 
     session_id: str | None = None
@@ -1021,6 +1024,7 @@ def execute_remote_notebook(
                     f"cell {position + 1} exhausted "
                     f"{CELL_EXECUTION_ATTEMPTS} attempts"
                 )
+                errors_by_cell[cell_index] = run_error
                 break
 
             try:
@@ -1034,6 +1038,9 @@ def execute_remote_notebook(
                 cell["outputs"] = result["outputs"]
                 cell["execution_count"] = result["execution_count"]
             except TimeoutError as exc:
+                errors_by_cell[cell_index] = (
+                    f"cell {position + 1} timed out: {exc}"
+                )
                 emit(
                     f"[RETRY] cell {position + 1} attempt {attempt}/"
                     f"{CELL_EXECUTION_ATTEMPTS} timed out: {exc}",
@@ -1052,6 +1059,9 @@ def execute_remote_notebook(
                 time.sleep(args.retry_delay_seconds)
                 continue
             except JupyterAPIError as exc:
+                errors_by_cell[cell_index] = (
+                    f"cell {position + 1} execution was interrupted: {exc}"
+                )
                 emit(
                     f"[KERNEL] transport failure while executing cell "
                     f"{position + 1}: {exc}",
@@ -1079,6 +1089,7 @@ def execute_remote_notebook(
             )
             error = cell_error(cell)
             if error:
+                errors_by_cell[cell_index] = error
                 if attempt >= CELL_EXECUTION_ATTEMPTS:
                     run_error = (
                         f"cell {position + 1} failed after {attempt} attempts: {error}"
@@ -1092,6 +1103,7 @@ def execute_remote_notebook(
                 time.sleep(args.retry_delay_seconds)
                 continue
 
+            errors_by_cell.pop(cell_index, None)
             run_error = None
             position += 1
             if position == len(code_cell_indexes):
@@ -1115,6 +1127,7 @@ def execute_remote_notebook(
         elapsed_seconds=elapsed,
         run_error=run_error,
         attempts_by_cell=attempts_by_cell,
+        errors_by_cell=errors_by_cell,
         kernel_session_attempts=kernel_session_attempts,
         timed_started_at=timed_started_at,
         timed_finished_at=timed_finished_at,
@@ -1124,6 +1137,7 @@ def execute_remote_notebook(
 def collect_user_cell_results(
     notebook: dict[str, Any],
     attempts_by_cell: dict[int, int],
+    errors_by_cell: dict[int, str],
 ) -> tuple[list[dict[str, Any]], int, int]:
     cells: list[dict[str, Any]] = []
     passed = failed = user_index = 0
@@ -1137,7 +1151,7 @@ def collect_user_cell_results(
         attempts = attempts_by_cell.get(notebook_index, 0)
         if not attempts:
             continue
-        error = cell_error(cell)
+        error = errors_by_cell.get(notebook_index) or cell_error(cell)
         if error:
             failed += 1
             cells.append(
@@ -1196,7 +1210,8 @@ def save_report(
 ) -> dict[str, Any]:
     executed_notebook = execution.notebook if execution else {"cells": []}
     attempts = execution.attempts_by_cell if execution else {}
-    cells, _, _ = collect_user_cell_results(executed_notebook, attempts)
+    errors = execution.errors_by_cell if execution else {}
+    cells, _, _ = collect_user_cell_results(executed_notebook, attempts, errors)
     elapsed = execution.elapsed_seconds if execution else 0.0
     report = common.make_report(
         target,

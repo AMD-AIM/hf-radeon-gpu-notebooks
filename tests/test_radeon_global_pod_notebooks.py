@@ -413,6 +413,62 @@ class CellRetryTests(unittest.TestCase):
         )
         self.assertEqual(result.kernel_session_attempts, 2)
         self.assertIsNone(result.run_error)
+        self.assertEqual(result.errors_by_cell, {})
+
+    def test_kernel_transport_failure_is_not_reported_as_a_passed_cell(self):
+        jupyter = FakeJupyter()
+
+        with (
+            mock.patch.object(
+                RUNNER,
+                "execute_cell",
+                side_effect=[
+                    success_result(1),
+                    RUNNER.JupyterAPIError(
+                        "kernel channel closed before the cell became idle"
+                    ),
+                ],
+            ),
+            mock.patch.object(RUNNER, "KERNEL_SESSION_ATTEMPTS", 1),
+        ):
+            result = RUNNER.execute_remote_notebook(
+                jupyter,
+                "cloud/model.ipynb",
+                notebook("setup-cell", "model-cell"),
+                args(),
+                lambda *_: None,
+            )
+
+        cells, passed, failed = RUNNER.collect_user_cell_results(
+            result.notebook,
+            result.attempts_by_cell,
+            result.errors_by_cell,
+        )
+
+        self.assertEqual(passed, 1)
+        self.assertEqual(failed, 1)
+        self.assertEqual(
+            [cell["status"] for cell in cells],
+            ["PASSED", "FAILED"],
+        )
+        self.assertIn("kernel channel closed", cells[1]["error"])
+        self.assertEqual(result.attempts_by_cell, {0: 1, 1: 1})
+        self.assertIn("kernel channel closed", result.run_error)
+
+        report = RUNNER.common.make_report(
+            RUNNER.common.Target("org/model", "org__model.ipynb"),
+            "radeon-pod__org__model.ipynb",
+            result.elapsed_seconds,
+            result.run_error,
+            cells,
+            result.timed_started_at,
+        )
+        report["cell_execution_retries"] = 0
+        with tempfile.TemporaryDirectory() as directory:
+            RUNNER.common.write_summary(Path(directory), [report], "pod-policy")
+            summary = (Path(directory) / "summary.md").read_text()
+
+        self.assertIn("| 1/1/2 |", summary)
 
     def test_session_handshake_failures_do_not_consume_cell_attempts(self):
         jupyter = FakeJupyter()
