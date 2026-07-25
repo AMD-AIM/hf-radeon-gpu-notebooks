@@ -33,6 +33,7 @@ concurrency:
 jobs:
   dispatch-targets:
     runs-on: ubuntu-latest
+    timeout-minutes: 355
     steps:
       - name: Dispatch target CIs in order
         env:
@@ -68,7 +69,8 @@ jobs:
           fi
 
           mapfile -t TARGETS <<<"$TARGET_LINES"
-          for TARGET in "${TARGETS[@]}"; do
+          for TARGET_INDEX in "${!TARGETS[@]}"; do
+            TARGET="${TARGETS[$TARGET_INDEX]}"
             case "$TARGET" in
               radeon-global)
                 TARGET_REF=hf_oneclick_radeon_global
@@ -91,6 +93,78 @@ jobs:
               )
             fi
 
+            BEFORE_RUN_ID="$(
+              gh api \
+                "repos/$GITHUB_REPOSITORY/actions/workflows/$TARGET_WORKFLOW/runs?branch=$TARGET_REF&event=workflow_dispatch&per_page=1" \
+                --jq '.workflow_runs[0].id // 0'
+            )"
             echo "Dispatching $TARGET to $TARGET_REF"
             gh workflow run "${ARGS[@]}"
+
+            # A concurrency group can hold only one running and one pending
+            # run. Do not create the next target while this target still
+            # occupies the pending slot, otherwise the later dispatch cancels
+            # this one. The last target needs no staging wait.
+            if [ "$TARGET_INDEX" -eq "$((${#TARGETS[@]} - 1))" ]; then
+              continue
+            fi
+
+            DISPATCHED_RUN_ID=""
+            for _ in $(seq 1 120); do
+              RUN_FIELDS="$(
+                gh api \
+                  "repos/$GITHUB_REPOSITORY/actions/workflows/$TARGET_WORKFLOW/runs?branch=$TARGET_REF&event=workflow_dispatch&per_page=20" \
+                  --jq ".workflow_runs
+                    | map(select(
+                        .id > $BEFORE_RUN_ID
+                        and .actor.login == \"github-actions[bot]\"
+                      ))
+                    | sort_by(.id)
+                    | .[0]
+                    | if . then [.id, .status, (.conclusion // \"\"), .html_url]
+                      else [] end
+                    | join(\"|\")"
+              )"
+              if [ -n "$RUN_FIELDS" ]; then
+                IFS='|' read -r DISPATCHED_RUN_ID RUN_STATUS RUN_CONCLUSION RUN_URL \
+                  <<<"$RUN_FIELDS"
+                echo "Created $TARGET run: $RUN_URL ($RUN_STATUS)"
+                break
+              fi
+              sleep 3
+            done
+            if [ -z "$DISPATCHED_RUN_ID" ]; then
+              echo "::error::Could not identify the dispatched $TARGET run"
+              exit 1
+            fi
+
+            for _ in $(seq 1 2100); do
+              IFS='|' read -r RUN_STATUS RUN_CONCLUSION RUN_URL <<<"$(
+                gh run view "$DISPATCHED_RUN_ID" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --json status,conclusion,url \
+                  --jq '[.status, (.conclusion // ""), .url] | join("|")'
+              )"
+              case "$RUN_STATUS" in
+                in_progress)
+                  echo "$TARGET is running; the pending slot is free: $RUN_URL"
+                  break
+                  ;;
+                completed)
+                  if [ "$RUN_CONCLUSION" = "cancelled" ]; then
+                    echo "::error::$TARGET was cancelled before the next target could be staged: $RUN_URL"
+                    exit 1
+                  fi
+                  echo "$TARGET completed before the next dispatch: $RUN_URL ($RUN_CONCLUSION)"
+                  break
+                  ;;
+                *)
+                  sleep 10
+                  ;;
+              esac
+            done
+            if [ "$RUN_STATUS" != "in_progress" ] && [ "$RUN_STATUS" != "completed" ]; then
+              echo "::error::Timed out waiting for $TARGET to leave the pending slot: $RUN_URL"
+              exit 1
+            fi
           done
