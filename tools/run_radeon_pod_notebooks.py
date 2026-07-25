@@ -35,7 +35,7 @@ DEFAULT_RADEON_IMAGE = (
 DEFAULT_HF_ENDPOINT = "http://134.199.133.77"
 STATE_FILE = Path(".radeon-pod-ci-state.json")
 CELL_EXECUTION_ATTEMPTS = 3
-KERNEL_SESSION_ATTEMPTS = 3
+KERNEL_SESSION_ATTEMPTS = 5
 REMOTE_INFERENCE_HEADING_RE = re.compile(
     r"(?im)^\s*##\s+Remote Inference via Inference Providers\b"
 )
@@ -224,7 +224,7 @@ class RadeonPodClient:
             params={"user_name": self.user_name},
         )
 
-    def create(self, model_id: str) -> dict[str, Any]:
+    def create(self, model_id: str, gpu_count: int = 1) -> dict[str, Any]:
         current = self.current()
         status = response_status(current)
         if status != "not_found":
@@ -234,27 +234,14 @@ class RadeonPodClient:
                 f"status={status or 'unknown'}, instance_id={instance}"
             )
 
-        pod_environment = {
-            "HF_ENDPOINT": self.hf_endpoint,
-            "HF_HUB_DISABLE_XET": "1",
-        }
-        if self.hf_token:
-            pod_environment.update(
-                {
-                    "HF_TOKEN": self.hf_token,
-                    "HUGGING_FACE_HUB_TOKEN": self.hf_token,
-                    "HUGGINGFACEHUB_API_TOKEN": self.hf_token,
-                }
-            )
         return self._request(
             "POST",
             payload={
                 "user_name": self.user_name,
                 "notebook_path": f"https://huggingface.co/{model_id}.ipynb",
-                "gpu_count": 1,
+                "gpu_count": gpu_count,
                 "pod_type": "one-click",
                 "image": self.image,
-                "env": pod_environment,
                 "unlimited_credits": True,
             },
         )
@@ -890,12 +877,50 @@ def local_inference_code_cell_indexes(
     return selected, skipped
 
 
+def configure_kernel_runtime(
+    websocket: Any,
+    session_id: str,
+    *,
+    environment: dict[str, str],
+    cell_timeout: float,
+    overall_deadline: float,
+) -> None:
+    """Set controller-owned runtime values without changing the notebook."""
+    if not environment:
+        return
+
+    source = (
+        "import os as _ci_os\n"
+        f"_ci_environment = {environment!r}\n"
+        "for _ci_key, _ci_value in _ci_environment.items():\n"
+        "    _ci_os.environ[_ci_key] = _ci_value\n"
+        "del _ci_key, _ci_value, _ci_environment, _ci_os\n"
+    )
+    try:
+        result = execute_cell(
+            websocket,
+            source,
+            session_id,
+            cell_timeout,
+            overall_deadline,
+        )
+    except TimeoutError as exc:
+        raise JupyterAPIError(f"kernel runtime configuration timed out: {exc}") from None
+    error = cell_error({"outputs": result["outputs"]})
+    if error:
+        raise JupyterAPIError(
+            "could not configure the kernel runtime: "
+            f"{common.redact_secrets(error)}"
+        )
+
+
 def execute_remote_notebook(
     jupyter: JupyterClient,
     remote_path: str,
     cloud_notebook: dict[str, Any],
     args: argparse.Namespace,
     emit: Callable[[str, bool], None],
+    kernel_environment: dict[str, str] | None = None,
 ) -> RemoteExecution:
     # Keep execution outputs in a controller-side copy. The cloud-managed
     # notebook is neither normalized nor overwritten through the Contents API.
@@ -947,6 +972,14 @@ def execute_remote_notebook(
                 try:
                     session_id, kernel_id = jupyter.create_session(remote_path)
                     websocket = jupyter.connect_channels(kernel_id, args.cell_timeout)
+                    if kernel_environment:
+                        configure_kernel_runtime(
+                            websocket,
+                            session_id,
+                            environment=kernel_environment,
+                            cell_timeout=args.cell_timeout,
+                            overall_deadline=time.monotonic() + args.notebook_timeout,
+                        )
                 except JupyterAPIError as exc:
                     run_error = str(exc)
                     cleanup_error = close_kernel_session(jupyter, websocket, session_id)
@@ -962,6 +995,13 @@ def execute_remote_notebook(
                 if started is None:
                     started = time.monotonic()
                     timed_started_at = common.utc_now()
+                    emit(
+                        "# kernel_runtime="
+                        f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT', DEFAULT_HF_ENDPOINT)}; "
+                        f"HF_TOKEN={'set' if common.runtime_hf_token() else 'missing'} "
+                        "(controller configured; excluded from timing)",
+                        False,
+                    )
                     emit(f"# timed_model_job_started {timed_started_at}", False)
                 elif position:
                     emit(
@@ -1131,6 +1171,15 @@ def redact_json_secrets(value: Any) -> Any:
     return value
 
 
+def sanitize_artifact_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
+    """Return a valid, redacted artifact copy without altering cloud content."""
+    artifact = redact_json_secrets(copy.deepcopy(notebook))
+    for cell in artifact.get("cells", []):
+        if isinstance(cell, dict):
+            cell.pop("output", None)
+    return artifact
+
+
 def save_report(
     target: common.Target,
     results_dir: Path,
@@ -1179,7 +1228,7 @@ def save_report(
 
     if execution is not None:
         output_notebook = results_dir / artifact_name
-        safe_executed_notebook = redact_json_secrets(execution.notebook)
+        safe_executed_notebook = sanitize_artifact_notebook(execution.notebook)
         output_notebook.write_text(
             json.dumps(safe_executed_notebook, indent=1, ensure_ascii=False) + "\n"
         )
@@ -1238,7 +1287,7 @@ def run_one(
 
         pod_setup_started = time.monotonic()
         try:
-            create_response = client.create(target.model_id)
+            create_response = client.create(target.model_id, target.gpu_count)
             pod_created = True
             created_instance_id = response_instance_id(create_response) or ""
             write_owned_state(
@@ -1285,7 +1334,8 @@ def run_one(
             pod_setup_elapsed = round(time.monotonic() - pod_setup_started, 3)
             emit(
                 f"# pod_setup={pod_setup_elapsed}s (excluded) "
-                f"instance_id={created_instance_id or 'unknown'}"
+                f"instance_id={created_instance_id or 'unknown'} "
+                f"gpu_count={target.gpu_count}"
             )
             emit(f"# cloud_notebook={remote_path} (managed by Radeon Global)")
 
@@ -1295,6 +1345,19 @@ def run_one(
                 cloud_notebook,
                 args,
                 emit,
+                kernel_environment={
+                    "HF_ENDPOINT": client.hf_endpoint,
+                    "HF_HUB_DISABLE_XET": "1",
+                    **(
+                        {
+                            "HF_TOKEN": client.hf_token,
+                            "HUGGING_FACE_HUB_TOKEN": client.hf_token,
+                            "HUGGINGFACEHUB_API_TOKEN": client.hf_token,
+                        }
+                        if client.hf_token
+                        else {}
+                    ),
+                },
             )
             started_at = execution.timed_started_at
             run_error = execution.run_error
@@ -1390,7 +1453,8 @@ def validate_cloud_plan(targets: list[common.Target]) -> list[str]:
             continue
         print(
             f"[PLAN OK] radeon-pod {target.model_id:45} "
-            f"artifact={target.notebook:45} cloud_source={notebook_url}",
+            f"gpus={target.gpu_count} artifact={target.notebook:45} "
+            f"cloud_source={notebook_url}",
             flush=True,
         )
     return errors
@@ -1401,7 +1465,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results-dir", default="results")
     parser.add_argument("--target-file", default=str(common.TARGET_CSV))
     parser.add_argument("--filter", default="")
-    parser.add_argument("--fail-on", choices=["all", "none"], default="none")
+    parser.add_argument("--fail-on", choices=["all", "none"], default="all")
     parser.add_argument("--plan-only", action="store_true")
     parser.add_argument("--cleanup-state", action="store_true")
     parser.add_argument("--state-file", default=str(STATE_FILE))
@@ -1464,7 +1528,8 @@ def main() -> None:
         f"source=radeon-global-managed; fail_on={args.fail_on}; "
         "backend=radeon-pod; "
         "startup_current_pod_reset=true; "
-        "pod_per_model=true; model_download=notebook-native; "
+        "pod_per_model=true; gpu_count=target-configured; "
+        "model_download=notebook-native; "
         f"cell_attempts={CELL_EXECUTION_ATTEMPTS}; "
         f"kernel_session_attempts={KERNEL_SESSION_ATTEMPTS}; "
         "timing=first-kernel-cell-start-to-last-kernel-cell-idle; "
@@ -1484,7 +1549,8 @@ def main() -> None:
         pending.remove(run_name)
         print(
             f"==> START {run_name} ({target.model_id}): "
-            "create Pod and use its cloud-managed notebook (excluded) -> "
+            f"create {target.gpu_count}-GPU Pod and use its cloud-managed "
+            "notebook (excluded) -> "
             "notebook cells with retry (timed) -> delete Pod (excluded)",
             flush=True,
         )
@@ -1497,14 +1563,18 @@ def main() -> None:
     common.write_summary(results_dir, reports, policy)
 
     if args.fail_on == "all":
+        expected = [target.model_id for target in targets]
+        actual = [report["model_id"] for report in reports]
         failing = [
             report
             for report in reports
             if report["overall_status"] != "PASSED"
         ]
-        if failing:
+        if actual != expected or failing:
             raise SystemExit(
-                f"{len(failing)} Radeon Pod notebook job(s) did not pass"
+                "Radeon Pod notebook CI was incomplete or not all-pass: "
+                f"expected={len(expected)}, reported={len(actual)}, "
+                f"not_passed={len(failing)}"
             )
 
 

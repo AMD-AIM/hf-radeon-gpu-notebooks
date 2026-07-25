@@ -103,7 +103,7 @@ jobs:
             --results-dir results
             --target-file doc/ci_target_models.csv
             --state-file "$RADEON_POD_STATE"
-            --fail-on none
+            --fail-on all
           )
           if [ -n "$FILTER" ]; then args+=(--filter "$FILTER"); fi
           tools/run_radeon_controller_container.sh execute \

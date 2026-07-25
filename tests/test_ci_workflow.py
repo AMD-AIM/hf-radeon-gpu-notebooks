@@ -143,6 +143,12 @@ class WorkflowFailureHandlingTests(unittest.TestCase):
         checkout_guard = "steps.checkout.outcome == 'success'"
         self.assertIn(checkout_guard, upload)
 
+    def test_notebook_runner_requires_every_selected_model_to_pass(self):
+        execute = step_block("Execute notebook CI")
+
+        self.assertIn("--fail-on all", execute)
+        self.assertNotIn("--fail-on none", execute)
+
 
 class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
     def test_workflow_identity_matches_radeon_global_branch(self):
