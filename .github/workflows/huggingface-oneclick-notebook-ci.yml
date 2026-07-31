@@ -9,7 +9,7 @@ on:
         required: false
         default: ""
       use_runner_hf_cache:
-        description: "Use the runner-local Hugging Face cache mounted from /disk/ssd2/huggingface_cache"
+        description: "Use the runner-local Hugging Face cache mounted from /nvme0/data/huggingface_cache"
         required: false
         default: "true"
         type: choice
@@ -108,7 +108,7 @@ jobs:
           case "$USE_RUNNER_HF_CACHE" in
             true|1|yes|y)
               HF_CACHE_MODE="runner"
-              HF_CACHE_ROOT=/disk/ssd2/huggingface_cache
+              HF_CACHE_ROOT=/nvme0/data/huggingface_cache
               mkdir -p "$HF_CACHE_ROOT/hub" "$HF_CACHE_ROOT/datasets"
               ;;
             false|0|no|n)
@@ -130,7 +130,7 @@ jobs:
             --group-add 44 --group-add 993 \
             --security-opt seccomp=unconfined \
             --ipc=host --shm-size 32g \
-            -v /disk/ssd2:/disk/ssd2 \
+            -v /nvme0/data/huggingface_cache:/nvme0/data/huggingface_cache \
             -v "$PWD":/workspace -w /workspace \
             -e HF_ENDPOINT=http://134.199.133.77 \
             -e HF_HUB_DISABLE_XET=1 \

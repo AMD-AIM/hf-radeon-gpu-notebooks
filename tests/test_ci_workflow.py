@@ -167,6 +167,14 @@ class WorkflowIdentityTests(unittest.TestCase):
 
 
 class WorkflowCacheConfigurationTests(unittest.TestCase):
+    def test_runner_cache_uses_the_new_nvme_path(self):
+        runner_cache = "/nvme0/data/huggingface_cache"
+
+        self.assertIn(f"HF_CACHE_ROOT={runner_cache}", WORKFLOW_TEXT)
+        self.assertIn(f"-v {runner_cache}:{runner_cache}", WORKFLOW_TEXT)
+        self.assertNotIn("/disk/ssd2/huggingface_cache", WORKFLOW_TEXT)
+        self.assertNotIn("-v /disk/ssd2:/disk/ssd2", WORKFLOW_TEXT)
+
     def test_hf_and_transformers_use_the_same_model_cache(self):
         self.assertIn(
             'HF_CACHE_ROOT="/tmp/huggingface_cache/'
