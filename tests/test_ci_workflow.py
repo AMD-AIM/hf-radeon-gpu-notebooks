@@ -151,6 +151,14 @@ class WorkflowFailureHandlingTests(unittest.TestCase):
 
 
 class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
+    def test_radeon_global_job_is_temporarily_disabled_before_runner_allocation(self):
+        job = WORKFLOW_TEXT.index("  run-notebooks:\n")
+        guard = WORKFLOW_TEXT.index("    if: ${{ false }}\n", job)
+        runner = WORKFLOW_TEXT.index("    runs-on:", job)
+
+        self.assertLess(guard, runner)
+        self.assertIn("keep Radeon Global CI inert", WORKFLOW_TEXT[job:runner])
+
     def test_workflow_identity_matches_radeon_global_branch(self):
         self.assertTrue(
             WORKFLOW_TEXT.startswith(
