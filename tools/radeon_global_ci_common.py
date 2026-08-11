@@ -246,15 +246,18 @@ def write_summary(
             "",
             "## Radeon Global Notebooks",
             "",
-            "| # | Status | Model | Download | Model Download Tries | "
-            "Cell Retries | Cells P/F/T | Total | Core error |",
-            "|--:|:------:|:------|---------:|------:|-------------:|"
-            ":-----------:|------:|:-----------|",
+            "| # | Status | Model | Resource template | Download | "
+            "Model Download Tries | Cell Retries | Cells P/F/T | Total | "
+            "Core error |",
+            "|--:|:------:|:------|:------------------|---------:|------:|"
+            "-------------:|:-----------:|------:|:-----------|",
         ]
         for index, report in enumerate(reports, 1):
             lines.append(
                 f"| {index} | {icons[report['overall_status']]} | "
-                f"`{report['model_id']}` | {format_download_duration(report)} | "
+                f"`{report['model_id']}` | "
+                f"`{report.get('resource_template', 'unknown')}` | "
+                f"{format_download_duration(report)} | "
                 f"{format_download_tries(report)} | "
                 f"{report.get('cell_execution_retries', 0)} | "
                 f"{report['cells_passed']}/{report['cells_failed']}/"

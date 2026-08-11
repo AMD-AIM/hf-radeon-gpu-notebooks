@@ -747,14 +747,62 @@ class PodSummaryTests(unittest.TestCase):
             None,
         )
         report["cell_execution_retries"] = 2
+        report["resource_template"] = "resource-16c55g1u"
+        omni_target = RUNNER.common.Target(
+            "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "Qwen__Qwen3-Omni-30B-A3B-Instruct.ipynb",
+        )
+        omni_report = RUNNER.common.make_report(
+            omni_target,
+            "radeon-pod__Qwen__Qwen3-Omni-30B-A3B-Instruct.ipynb",
+            84.0,
+            None,
+            [{"index": 1, "status": "PASSED", "error": None}],
+            None,
+        )
+        omni_report["cell_execution_retries"] = 0
+        omni_report["resource_template"] = "resource-16c110g1u"
 
         with tempfile.TemporaryDirectory() as directory:
-            RUNNER.common.write_summary(Path(directory), [report], "pod-policy")
+            RUNNER.common.write_summary(
+                Path(directory), [report, omni_report], "pod-policy"
+            )
             summary = (Path(directory) / "summary.md").read_text()
 
-        self.assertIn("| Model | Download | Model Download Tries | Cell Retries |", summary)
-        self.assertIn("`org/model` | in notebook | \\ | 2 |", summary)
+        self.assertIn(
+            "| Model | Resource template | Download | Model Download Tries |",
+            summary,
+        )
+        self.assertIn(
+            "`org/model` | `resource-16c55g1u` | in notebook | \\ | 2 |",
+            summary,
+        )
+        self.assertIn(
+            "`Qwen/Qwen3-Omni-30B-A3B-Instruct` | "
+            "`resource-16c110g1u` | in notebook | \\ | 0 |",
+            summary,
+        )
         self.assertIn("| 1/0/1 | 42s |", summary)
+
+    def test_saved_report_records_selected_resource_template(self):
+        target = RUNNER.common.Target(
+            "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "Qwen__Qwen3-Omni-30B-A3B-Instruct.ipynb",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report = RUNNER.save_report(
+                target,
+                Path(directory),
+                "radeon-pod__Qwen__Qwen3-Omni-30B-A3B-Instruct.ipynb",
+                None,
+                None,
+                None,
+                None,
+                0.0,
+                0.0,
+            )
+
+        self.assertEqual(report["resource_template"], "resource-16c110g1u")
 
 
 if __name__ == "__main__":

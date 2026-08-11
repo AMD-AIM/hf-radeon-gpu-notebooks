@@ -1314,6 +1314,7 @@ def save_report(
     user_attempts = [int(cell.get("attempts") or 0) for cell in cells]
     report.update(
         {
+            "resource_template": resource_template_for_model(target.model_id),
             "pod_setup_elapsed_seconds": pod_setup_elapsed,
             "pod_delete_elapsed_seconds": pod_delete_elapsed,
             "timing_scope": "first-kernel-cell-start-to-last-kernel-cell-idle",
