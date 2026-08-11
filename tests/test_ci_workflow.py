@@ -162,6 +162,11 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
             "  push:\n    branches: [hf_oneclick_radeon_global]\n",
             WORKFLOW_TEXT,
         )
+        self.assertIn(
+            "RADEON_NOTEBOOK_API: "
+            "https://radeon-global.anruicloud.com/api/service/notebooks",
+            WORKFLOW_TEXT,
+        )
 
     def test_self_hosted_runner_uses_only_an_isolated_controller_container(self):
         execute = step_block("Execute notebook CI")

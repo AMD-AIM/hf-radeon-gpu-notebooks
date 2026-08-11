@@ -142,14 +142,14 @@ def notebook(*sources: str):
 class RadeonGlobalPodAPITests(unittest.TestCase):
     def client(self):
         return RUNNER.RadeonPodClient(
-            "https://example.invalid/api/huggingface/notebooks",
+            "https://example.invalid/api/service/notebooks",
             "user@example.com",
             "radeon-secret-token",
             "registry/image:test",
             hf_token="hf-secret-token",
         )
 
-    def test_create_uses_native_notebook_with_supported_payload(self):
+    def test_create_uses_native_notebook_with_default_resource_payload(self):
         client = self.client()
         with (
             mock.patch.object(
@@ -171,8 +171,114 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
             "https://huggingface.co/org/model.ipynb",
         )
         self.assertEqual(payload["image"], "registry/image:test")
-        self.assertEqual(payload["gpu_count"], 1)
+        self.assertEqual(payload["pod_type"], "hf")
+        self.assertEqual(payload["resource_template"], "resource-16c55g1u")
+        self.assertEqual(payload["instance_type"], "jupyter")
+        self.assertNotIn("gpu_count", payload)
         self.assertNotIn("env", payload)
+        self.assertRegex(
+            request.call_args.kwargs["idempotency_key"],
+            r"^hf-oneclick-ci-[0-9a-f-]{36}$",
+        )
+
+    def test_create_uses_high_memory_resource_for_qwen3_omni(self):
+        client = self.client()
+        with (
+            mock.patch.object(
+                client,
+                "current",
+                return_value={"status": "not_found"},
+            ),
+            mock.patch.object(
+                client,
+                "_request",
+                return_value={"status": "allocating"},
+            ) as request,
+        ):
+            client.create("Qwen/Qwen3-Omni-30B-A3B-Instruct")
+
+        payload = request.call_args.kwargs["payload"]
+        self.assertEqual(payload["resource_template"], "resource-16c110g1u")
+
+    def test_wait_ready_opens_service_notebook_for_jupyter_url(self):
+        client = self.client()
+        with mock.patch.object(
+            client,
+            "open_current",
+            return_value={
+                "url": "https://handoff.invalid/one-time",
+                "direct_url": "https://jupyter.invalid/lab/tree/model.ipynb",
+                "one_time": True,
+            },
+        ) as open_current:
+            ready = client.wait_ready(
+                {"status": "ready", "instance_id": "instance-1"},
+                timeout=30,
+                poll_seconds=0,
+            )
+
+        self.assertEqual(
+            ready["jupyter_url"],
+            "https://jupyter.invalid/lab/tree/model.ipynb",
+        )
+        self.assertEqual(
+            ready["jupyter_handoff_url"],
+            "https://handoff.invalid/one-time",
+        )
+        open_current.assert_called_once_with()
+
+    def test_open_current_uses_service_open_endpoint(self):
+        client = self.client()
+        with mock.patch.object(client, "_request", return_value={}) as request:
+            client.open_current()
+
+        request.assert_called_once_with(
+            "POST",
+            "/current/open",
+            params={"user_name": "user@example.com"},
+        )
+
+    def test_request_sends_idempotency_header(self):
+        client = self.client()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+        with mock.patch.object(
+            RUNNER.urllib.request,
+            "urlopen",
+            return_value=response,
+        ) as urlopen:
+            client._request(
+                "POST",
+                payload={"user_name": "user@example.com"},
+                idempotency_key="test-idempotency-key",
+            )
+
+        sent_request = urlopen.call_args.args[0]
+        self.assertEqual(
+            sent_request.get_header("Idempotency-key"),
+            "test-idempotency-key",
+        )
+
+    def test_jupyter_client_redeems_one_time_handoff(self):
+        handoff_url = "https://handoff.invalid/one-time"
+        direct_url = "https://jupyter.invalid/lab/tree/model.ipynb"
+        opener = mock.MagicMock()
+        opener.open.return_value.__enter__.return_value.geturl.return_value = (
+            direct_url
+        )
+        with mock.patch.object(
+            RUNNER.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            jupyter = RUNNER.JupyterClient(
+                handoff_url,
+                bootstrap_url=handoff_url,
+            )
+
+        self.assertEqual(jupyter.access_url, direct_url)
+        sent_request = opener.open.call_args.args[0]
+        self.assertEqual(sent_request.full_url, handoff_url)
 
     def test_create_refuses_to_replace_an_existing_user_pod(self):
         client = self.client()

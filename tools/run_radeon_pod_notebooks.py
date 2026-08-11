@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import http.cookiejar
 import json
 import os
 import re
@@ -27,11 +28,14 @@ except ModuleNotFoundError:
     from tools import radeon_global_ci_common as common
 
 
-DEFAULT_RADEON_API = "https://radeon-global.anruicloud.com/api/huggingface/notebooks"
+DEFAULT_RADEON_API = "https://radeon-global.anruicloud.com/api/service/notebooks"
 DEFAULT_RADEON_IMAGE = (
     "10.5.10.12:1808/radeon-cloud-global/"
     "huaggingface_for_amd_radeon:20260711_workaround_fix_torch_streaming"
 )
+DEFAULT_RESOURCE_TEMPLATE = "resource-16c55g1u"
+HIGH_MEMORY_RESOURCE_TEMPLATE = "resource-16c110g1u"
+HIGH_MEMORY_MODELS = frozenset({"Qwen/Qwen3-Omni-30B-A3B-Instruct"})
 DEFAULT_HF_ENDPOINT = "http://134.199.133.77"
 STATE_FILE = Path(".radeon-pod-ci-state.json")
 CELL_EXECUTION_ATTEMPTS = 3
@@ -142,6 +146,12 @@ def response_status(value: Any) -> str:
     return ""
 
 
+def resource_template_for_model(model_id: str) -> str:
+    if model_id in HIGH_MEMORY_MODELS:
+        return HIGH_MEMORY_RESOURCE_TEMPLATE
+    return DEFAULT_RESOURCE_TEMPLATE
+
+
 class RadeonPodClient:
     def __init__(
         self,
@@ -171,21 +181,25 @@ class RadeonPodClient:
         *,
         params: dict[str, str] | None = None,
         payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         url = self.api_url + path
         if params:
             url += "?" + urllib.parse.urlencode(params)
         body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {self.api_token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "hf-oneclick-radeon-pod-ci",
+        }
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
         request = urllib.request.Request(
             url,
             data=body,
             method=method,
-            headers={
-                "Authorization": f"Bearer {self.api_token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": "hf-oneclick-radeon-pod-ci",
-            },
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
@@ -235,16 +249,26 @@ class RadeonPodClient:
                 f"status={status or 'unknown'}, instance_id={instance}"
             )
 
+        resource_template = resource_template_for_model(model_id)
         return self._request(
             "POST",
             payload={
                 "user_name": self.user_name,
                 "notebook_path": f"https://huggingface.co/{model_id}.ipynb",
-                "gpu_count": 1,
-                "pod_type": "one-click",
+                "pod_type": "hf",
+                "resource_template": resource_template,
+                "instance_type": "jupyter",
                 "image": self.image,
                 "unlimited_credits": True,
             },
+            idempotency_key=f"hf-oneclick-ci-{uuid.uuid4()}",
+        )
+
+    def open_current(self) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/current/open",
+            params={"user_name": self.user_name},
         )
 
     def delete_current(self) -> dict[str, Any]:
@@ -263,6 +287,7 @@ class RadeonPodClient:
         deadline = time.monotonic() + timeout
         current = initial
         access_url = find_jupyter_url(initial)
+        handoff_url: str | None = None
         last_status = ""
         while True:
             status = response_status(current)
@@ -274,9 +299,24 @@ class RadeonPodClient:
                     flush=True,
                 )
                 last_status = status
+            if status == "ready" and not access_url:
+                opened = self.open_current()
+                handoff_url = find_jupyter_url(opened)
+                direct_url = opened.get("direct_url")
+                if not isinstance(direct_url, str) or not direct_url.startswith(
+                    ("http://", "https://")
+                ):
+                    direct_url = None
+                access_url = direct_url or handoff_url
+                if not access_url:
+                    raise RadeonPodError(
+                        "ready Radeon Pod open response did not provide a Jupyter URL"
+                    )
             if status == "ready" and access_url:
                 result = dict(current)
                 result["jupyter_url"] = access_url
+                if handoff_url:
+                    result["jupyter_handoff_url"] = handoff_url
                 return result
             if status in {"failed", "error"}:
                 message = common.compact_error(str(current.get("message") or ""), 300)
@@ -423,7 +463,48 @@ def reset_current_pod_before_run(
 
 
 class JupyterClient:
-    def __init__(self, access_url: str, request_timeout: int = 60) -> None:
+    def __init__(
+        self,
+        access_url: str,
+        request_timeout: int = 60,
+        bootstrap_url: str | None = None,
+    ) -> None:
+        self.request_timeout = request_timeout
+        self.cookie_jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.cookie_jar)
+        )
+
+        if bootstrap_url:
+            common.SECRET_VALUES.add(bootstrap_url)
+            bootstrap_request = urllib.request.Request(
+                bootstrap_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml",
+                    "User-Agent": "hf-oneclick-radeon-pod-ci",
+                },
+            )
+            try:
+                with self.opener.open(
+                    bootstrap_request,
+                    timeout=self.request_timeout,
+                ) as response:
+                    redirected_url = response.geturl()
+            except urllib.error.HTTPError as exc:
+                detail = safe_response_text(exc.read()) or exc.reason
+                raise JupyterAPIError(
+                    "Radeon Jupyter handoff failed with HTTP "
+                    f"{exc.code}: {detail}"
+                ) from None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise JupyterAPIError(
+                    "Radeon Jupyter handoff failed: "
+                    f"{type(exc).__name__}: "
+                    f"{common.redact_secrets(str(exc))}"
+                ) from None
+            if access_url == bootstrap_url:
+                access_url = redirected_url
+
         parsed = urllib.parse.urlsplit(access_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise JupyterAPIError("Radeon API returned an invalid Jupyter URL")
@@ -434,8 +515,8 @@ class JupyterClient:
         self.netloc = parsed.netloc
         self.base_path = base_path.rstrip("/")
         self.query = parsed.query
-        self.request_timeout = request_timeout
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
+        self.access_url = access_url
 
         common.SECRET_VALUES.add(access_url)
         for _, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
@@ -460,18 +541,23 @@ class JupyterClient:
         payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         body = None if payload is None else json.dumps(payload).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "hf-oneclick-radeon-pod-ci",
+        }
+        for cookie in self.cookie_jar:
+            if cookie.name == "_xsrf":
+                headers["X-XSRFToken"] = cookie.value
+                break
         request = urllib.request.Request(
             self._url(api_path),
             data=body,
             method=method,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": "hf-oneclick-radeon-pod-ci",
-            },
+            headers=headers,
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.request_timeout) as response:
+            with self.opener.open(request, timeout=self.request_timeout) as response:
                 raw = response.read()
         except urllib.error.HTTPError as exc:
             detail = safe_response_text(exc.read()) or exc.reason
@@ -590,11 +676,15 @@ class JupyterClient:
             websocket=True,
         )
         try:
+            cookie = "; ".join(
+                f"{item.name}={item.value}" for item in self.cookie_jar
+            )
             return websocket.create_connection(
                 url,
                 timeout=timeout,
                 origin=self.origin,
                 enable_multithread=True,
+                **({"cookie": cookie} if cookie else {}),
             )
         except Exception as exc:
             raise JupyterAPIError(
@@ -1333,12 +1423,13 @@ def run_one(
             jupyter = JupyterClient(
                 access_url,
                 request_timeout=args.jupyter_request_timeout,
+                bootstrap_url=ready.get("jupyter_handoff_url"),
             )
             jupyter.wait_available(
                 args.jupyter_ready_timeout,
                 args.pod_poll_seconds,
             )
-            remote_path = notebook_path_from_jupyter_url(access_url)
+            remote_path = notebook_path_from_jupyter_url(jupyter.access_url)
             if not remote_path:
                 raise RadeonPodError(
                     "ready Radeon Pod URL did not identify a cloud-managed notebook"
@@ -1352,7 +1443,8 @@ def run_one(
             pod_setup_elapsed = round(time.monotonic() - pod_setup_started, 3)
             emit(
                 f"# pod_setup={pod_setup_elapsed}s (excluded) "
-                f"instance_id={created_instance_id or 'unknown'} gpu_count=1"
+                f"instance_id={created_instance_id or 'unknown'} "
+                f"resource_template={resource_template_for_model(target.model_id)}"
             )
             emit(f"# cloud_notebook={remote_path} (managed by Radeon Global)")
 
@@ -1470,7 +1562,8 @@ def validate_cloud_plan(targets: list[common.Target]) -> list[str]:
             continue
         print(
             f"[PLAN OK] radeon-pod {target.model_id:45} "
-            f"gpu=1 artifact={target.notebook:45} cloud_source={notebook_url}",
+            f"resource_template={resource_template_for_model(target.model_id)} "
+            f"artifact={target.notebook:45} cloud_source={notebook_url}",
             flush=True,
         )
     return errors
@@ -1544,7 +1637,7 @@ def main() -> None:
         f"source=radeon-global-managed; fail_on={args.fail_on}; "
         "backend=radeon-pod; "
         "startup_current_pod_reset=true; "
-        "pod_per_model=true; gpu_count=1; "
+        "pod_per_model=true; resource_template=per-model; "
         "model_download=notebook-native; "
         f"cell_attempts={CELL_EXECUTION_ATTEMPTS}; "
         f"kernel_session_attempts={KERNEL_SESSION_ATTEMPTS}; "
@@ -1565,7 +1658,8 @@ def main() -> None:
         pending.remove(run_name)
         print(
             f"==> START {run_name} ({target.model_id}): "
-            "create 1-GPU Pod and use its cloud-managed notebook "
+            f"create {resource_template_for_model(target.model_id)} Pod and use "
+            "its cloud-managed notebook "
             "(excluded) -> "
             "notebook cells with retry (timed) -> delete Pod (excluded)",
             flush=True,
