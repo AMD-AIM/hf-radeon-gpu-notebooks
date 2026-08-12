@@ -229,7 +229,18 @@ class WorkflowGitTransportTests(unittest.TestCase):
             'retry_git git_via_fetch_proxy pull --rebase origin "$BRANCH"',
             sync,
         )
-        self.assertIn('retry_git git push origin "HEAD:$BRANCH"', sync)
+        self.assertIn(
+            'local github_repo_url="https://github.com/${GITHUB_REPOSITORY}"',
+            sync,
+        )
+        self.assertIn(
+            '-c "url.${github_repo_url}.insteadOf=${github_repo_url}"',
+            sync,
+        )
+        self.assertIn(
+            'retry_git git_direct_github push origin "HEAD:$BRANCH"',
+            sync,
+        )
         self.assertNotIn("git_via_fetch_proxy push", sync)
 
 
