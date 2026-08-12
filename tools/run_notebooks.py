@@ -25,6 +25,8 @@ REPO = Path(__file__).resolve().parents[1]
 TARGET_CSV = REPO / "doc" / "ci_target_models.csv"
 ORIGINAL_NOTEBOOK_DIR = REPO / "original_notebooks"
 HF_CANONICAL = "https://huggingface.co"
+NOTEBOOK_SOURCE_HOST = "huggingface.co"
+NOTEBOOK_MIRROR_HOST = "hf-mirror.com"
 VRAM_BUDGET_GB = float(os.environ.get("RADEON_CI_VRAM_PER_GPU_GB", "48"))
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 SECRET_HINTS = ("TOKEN", "KEY", "SECRET", "PASSWORD")
@@ -208,6 +210,16 @@ def notebook_json_text(notebook: dict[str, Any]) -> str:
     return json.dumps(notebook, indent=1, ensure_ascii=False) + "\n"
 
 
+def canonicalize_notebook_sources(notebook: dict[str, Any]) -> dict[str, Any]:
+    """Keep repository snapshots independent of the endpoint used to fetch them."""
+    canonical = copy.deepcopy(notebook)
+    for cell in canonical.get("cells", []):
+        cell["source"] = "".join(cell.get("source", [])).replace(
+            NOTEBOOK_MIRROR_HOST, NOTEBOOK_SOURCE_HOST
+        )
+    return canonical
+
+
 def notebook_has_effective_update(snapshot_path: Path, downloaded: dict[str, Any]) -> bool:
     if not snapshot_path.is_file():
         return True
@@ -280,7 +292,13 @@ def load_notebook(
         for attempt in range(1, 4):
             try:
                 raw_text = read_text_url(url)
-                notebook = parse_notebook_json(raw_text, url)
+                # A mirror may rewrite links embedded in its generated notebook.
+                # Restore the canonical host before persisting or returning the
+                # repository copy; normalize_notebook() rewrites only the later
+                # deep-copied execution document back to the configured mirror.
+                notebook = canonicalize_notebook_sources(
+                    parse_notebook_json(raw_text, url)
+                )
                 snapshot = (
                     write_original_notebook_snapshot(target, notebook)
                     if sync_native_snapshot
@@ -396,6 +414,12 @@ def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
         if drop_cell:
             continue
 
+        # Rewrite only the deep-copied execution document. The downloaded
+        # notebook snapshot and the repository artifact keep their original
+        # source so CI never commits mirror-specific edits upstream.
+        cell["source"] = "".join(cell.get("source", [])).replace(
+            NOTEBOOK_SOURCE_HOST, NOTEBOOK_MIRROR_HOST
+        )
         if cell.get("cell_type") != "code":
             cells.append(cell)
             continue
@@ -403,7 +427,6 @@ def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
         metadata = dict(cell.get("metadata") or {})
         metadata["ci_original_cell_index"] = original_index
         cell["metadata"] = metadata
-        cell["source"] = "".join(cell.get("source", []))
         cell["outputs"] = []
         cell["execution_count"] = None
         cells.append(cell)

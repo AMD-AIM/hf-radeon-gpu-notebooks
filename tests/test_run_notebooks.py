@@ -242,6 +242,77 @@ class NotebookNormalizationTests(unittest.TestCase):
         )
         self.assertEqual(artifact_code[0]["outputs"][0]["text"], "fresh")
 
+    def test_huggingface_urls_are_rewritten_only_in_execution_copy(self):
+        notebook = notebook_document(
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": "Model: https://huggingface.co/org/model",
+            },
+            code_cell(
+                "url = 'https://huggingface.co/org/model/resolve/main/config.json'"
+            ),
+        )
+
+        normalized = RUNNER.normalize_notebook(notebook)
+        normalized_sources = [
+            "".join(cell.get("source", [])) for cell in normalized["cells"]
+        ]
+        original_sources = [
+            "".join(cell.get("source", [])) for cell in notebook["cells"]
+        ]
+
+        self.assertTrue(all("huggingface.co" not in source for source in normalized_sources))
+        self.assertTrue(all("hf-mirror.com" in source for source in normalized_sources))
+        self.assertTrue(all("huggingface.co" in source for source in original_sources))
+        self.assertTrue(all("hf-mirror.com" not in source for source in original_sources))
+
+    def test_mirror_download_keeps_canonical_repository_snapshot(self):
+        notebook = notebook_document(
+            code_cell("url = 'https://hf-mirror.com/org/model'"),
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": "## Remote Inference via Inference Providers",
+            },
+            code_cell("print('remote provider call')"),
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": "## Local inference",
+            },
+            code_cell("print('local inference')"),
+        )
+        target = RUNNER.Target(model_id="org/model", notebook="org__model.ipynb")
+
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot_dir = Path(directory)
+            with (
+                mock.patch.object(RUNNER, "ORIGINAL_NOTEBOOK_DIR", snapshot_dir),
+                mock.patch.object(
+                    RUNNER, "read_text_url", return_value=RUNNER.notebook_json_text(notebook)
+                ),
+                mock.patch.dict(
+                    os.environ, {"HF_ENDPOINT": "https://hf-mirror.com"}, clear=False
+                ),
+            ):
+                original, source = RUNNER.load_notebook(target)
+                normalized = RUNNER.normalize_notebook(original)
+                saved_source = (snapshot_dir / target.notebook).read_text()
+
+        self.assertEqual(source["snapshot"], str(snapshot_dir / target.notebook))
+        self.assertIn("huggingface.co", saved_source)
+        self.assertNotIn("hf-mirror.com", saved_source)
+        self.assertIn("Remote Inference via Inference Providers", saved_source)
+        self.assertIn("remote provider call", saved_source)
+        self.assertIn("hf-mirror.com", normalized["cells"][0]["source"])
+        normalized_source = "\n".join(
+            "".join(cell.get("source", [])) for cell in normalized["cells"]
+        )
+        self.assertNotIn("Remote Inference via Inference Providers", normalized_source)
+        self.assertNotIn("remote provider call", normalized_source)
+        self.assertIn("local inference", normalized_source)
+
 
 class SummaryTests(unittest.TestCase):
     def report(self, model_id: str, cache_mode: str, attempts: int, elapsed: float):

@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 2880
     env:
       CI_CONTAINER: hf-ci-oneclick-${{ github.run_id }}
-      HF_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260711_workaround_fix_torch_streaming
+      HF_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/huaggingface_for_amd_radeon:20260812
 
     steps:
       - name: Clear stale run outputs
@@ -132,8 +132,7 @@ jobs:
             --ipc=host --shm-size 32g \
             -v /nvme0/data/huggingface_cache:/nvme0/data/huggingface_cache \
             -v "$PWD":/workspace -w /workspace \
-            -e HF_ENDPOINT=http://134.199.133.77 \
-            -e HF_HUB_DISABLE_XET=1 \
+            -e HF_ENDPOINT=https://hf-mirror.com \
             -e HF_TOKEN="$HF_ONECLICK_TOKEN" \
             -e HUGGING_FACE_HUB_TOKEN="$HF_ONECLICK_TOKEN" \
             -e HUGGINGFACEHUB_API_TOKEN="$HF_ONECLICK_TOKEN" \

@@ -189,6 +189,20 @@ class WorkflowCacheConfigurationTests(unittest.TestCase):
         )
 
 
+class WorkflowHuggingFaceNetworkConfigurationTests(unittest.TestCase):
+    def test_local_ci_uses_final_image_and_public_mirror_endpoint(self):
+        execute = step_block("Execute notebook CI")
+
+        self.assertIn(
+            "HF_CI_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/"
+            "images_hana/huaggingface_for_amd_radeon:20260812",
+            WORKFLOW_TEXT,
+        )
+        self.assertIn("-e HF_ENDPOINT=https://hf-mirror.com", execute)
+        self.assertNotIn("134.199.133.77", execute)
+        self.assertNotIn("HF_HUB_DISABLE_XET", execute)
+
+
 class WorkflowGitTransportTests(unittest.TestCase):
     def test_checkout_proxy_rewrite_is_step_scoped(self):
         checkout = step_block("Checkout target revision")
