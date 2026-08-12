@@ -269,7 +269,12 @@ class NotebookNormalizationTests(unittest.TestCase):
 
     def test_mirror_download_keeps_canonical_repository_snapshot(self):
         notebook = notebook_document(
-            code_cell("url = 'https://hf-mirror.com/org/model'"),
+            code_cell(
+                [
+                    "url = 'https://hf-mirror.com/org/model'\n",
+                    "print(url)",
+                ]
+            ),
             {
                 "cell_type": "markdown",
                 "metadata": {},
@@ -301,6 +306,14 @@ class NotebookNormalizationTests(unittest.TestCase):
                 saved_source = (snapshot_dir / target.notebook).read_text()
 
         self.assertEqual(source["snapshot"], str(snapshot_dir / target.notebook))
+        self.assertEqual(
+            original["cells"][0]["source"],
+            ["url = 'https://huggingface.co/org/model'\n", "print(url)"],
+        )
+        self.assertEqual(
+            notebook["cells"][0]["source"],
+            ["url = 'https://hf-mirror.com/org/model'\n", "print(url)"],
+        )
         self.assertIn("huggingface.co", saved_source)
         self.assertNotIn("hf-mirror.com", saved_source)
         self.assertIn("Remote Inference via Inference Providers", saved_source)

@@ -214,9 +214,18 @@ def canonicalize_notebook_sources(notebook: dict[str, Any]) -> dict[str, Any]:
     """Keep repository snapshots independent of the endpoint used to fetch them."""
     canonical = copy.deepcopy(notebook)
     for cell in canonical.get("cells", []):
-        cell["source"] = "".join(cell.get("source", [])).replace(
-            NOTEBOOK_MIRROR_HOST, NOTEBOOK_SOURCE_HOST
-        )
+        source = cell.get("source", [])
+        if isinstance(source, str):
+            cell["source"] = source.replace(
+                NOTEBOOK_MIRROR_HOST, NOTEBOOK_SOURCE_HOST
+            )
+        elif isinstance(source, list):
+            cell["source"] = [
+                part.replace(NOTEBOOK_MIRROR_HOST, NOTEBOOK_SOURCE_HOST)
+                if isinstance(part, str)
+                else part
+                for part in source
+            ]
     return canonical
 
 
