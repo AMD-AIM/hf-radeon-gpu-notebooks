@@ -39,6 +39,10 @@ HIGH_MEMORY_MODELS = frozenset({"Qwen/Qwen3-Omni-30B-A3B-Instruct"})
 STATE_FILE = Path(".radeon-pod-ci-state.json")
 CELL_EXECUTION_ATTEMPTS = 3
 KERNEL_SESSION_ATTEMPTS = 5
+SESSION_CLEANUP_ATTEMPTS = 5
+DELETING_POD_STATUSES = frozenset({"reconciling", "terminating"})
+CREATE_DELETE_WAIT_TIMEOUT = 600
+CREATE_DELETE_POLL_SECONDS = 5
 REMOTE_INFERENCE_HEADING_RE = re.compile(
     r"(?im)^\s*##\s+Remote Inference via Inference Providers\b"
 )
@@ -239,6 +243,18 @@ class RadeonPodClient:
     def create(self, model_id: str) -> dict[str, Any]:
         current = self.current()
         status = response_status(current)
+        if status in DELETING_POD_STATUSES:
+            print(
+                f"[POD] waiting for prior instance deletion "
+                f"(status={status})",
+                flush=True,
+            )
+            self.wait_deleted(
+                CREATE_DELETE_WAIT_TIMEOUT,
+                CREATE_DELETE_POLL_SECONDS,
+            )
+            current = self.current()
+            status = response_status(current)
         if status != "not_found":
             instance = response_instance_id(current) or "unknown"
             raise RadeonPodError(
@@ -331,18 +347,32 @@ class RadeonPodClient:
     def wait_deleted(self, timeout: float, poll_seconds: float) -> None:
         deadline = time.monotonic() + timeout
         last_status = ""
+        last_error = ""
         while True:
-            current = self.current()
-            status = response_status(current)
-            if status != last_status:
-                print(f"[POD] delete status={status or 'unknown'}", flush=True)
-                last_status = status
-            if status == "not_found":
-                return
+            try:
+                current = self.current()
+            except RadeonPodError as exc:
+                error = common.compact_error(str(exc), 300)
+                if error != last_error:
+                    print(f"[POD] delete poll retry: {error}", flush=True)
+                    last_error = error
+            else:
+                last_error = ""
+                status = response_status(current)
+                if status != last_status:
+                    print(f"[POD] delete status={status or 'unknown'}", flush=True)
+                    last_status = status
+                if status == "not_found":
+                    return
             if time.monotonic() >= deadline:
+                detail = (
+                    f", last error={last_error}"
+                    if last_error
+                    else ""
+                )
                 raise RadeonPodError(
                     f"Radeon Pod was not fully deleted within {int(timeout)}s "
-                    f"(last status={status or 'unknown'})"
+                    f"(last status={last_status or 'unknown'}{detail})"
                 )
             time.sleep(poll_seconds)
 
@@ -1000,6 +1030,7 @@ def close_kernel_session(
     jupyter: JupyterClient,
     websocket: Any,
     session_id: str | None,
+    retry_delay_seconds: float = 0,
 ) -> str | None:
     if websocket is not None:
         try:
@@ -1007,10 +1038,19 @@ def close_kernel_session(
         except Exception:
             pass
     if session_id:
-        try:
-            jupyter.delete_session(session_id)
-        except JupyterAPIError as exc:
-            return f"Jupyter session cleanup failed: {exc}"
+        last_error = ""
+        for attempt in range(1, SESSION_CLEANUP_ATTEMPTS + 1):
+            try:
+                jupyter.delete_session(session_id)
+                return None
+            except JupyterAPIError as exc:
+                last_error = str(exc)
+                if attempt < SESSION_CLEANUP_ATTEMPTS:
+                    time.sleep(retry_delay_seconds)
+        return (
+            "Jupyter session cleanup failed after "
+            f"{SESSION_CLEANUP_ATTEMPTS} attempts: {last_error}"
+        )
     return None
 
 
@@ -1145,7 +1185,12 @@ def execute_remote_notebook(
                         )
                 except JupyterAPIError as exc:
                     run_error = str(exc)
-                    cleanup_error = close_kernel_session(jupyter, websocket, session_id)
+                    cleanup_error = close_kernel_session(
+                        jupyter,
+                        websocket,
+                        session_id,
+                        args.retry_delay_seconds,
+                    )
                     if cleanup_error:
                         run_error = f"{run_error}; {cleanup_error}"
                     websocket = None
@@ -1226,15 +1271,30 @@ def execute_remote_notebook(
                     f"{position + 1}: {exc}",
                     True,
                 )
-                cleanup_error = close_kernel_session(jupyter, websocket, session_id)
+                cleanup_error = close_kernel_session(
+                    jupyter,
+                    websocket,
+                    session_id,
+                    args.retry_delay_seconds,
+                )
                 if cleanup_error:
                     emit(f"[KERNEL] {cleanup_error}", True)
                 websocket = None
                 session_id = None
                 kernel_id = None
-                run_error = str(exc)
+                run_error = (
+                    f"{exc}; {cleanup_error}"
+                    if cleanup_error
+                    else str(exc)
+                )
+                if cleanup_error:
+                    break
                 if kernel_session_attempts >= KERNEL_SESSION_ATTEMPTS:
                     break
+                # A transport interruption is a kernel/session recovery, not a
+                # completed cell attempt. Preserve the attempt budget for the
+                # replay in the fresh kernel.
+                attempts_by_cell[cell_index] -= 1
                 time.sleep(args.retry_delay_seconds)
                 continue
 
@@ -1272,7 +1332,12 @@ def execute_remote_notebook(
         if started is not None and timed_finished is None:
             timed_finished = time.monotonic()
             timed_finished_at = common.utc_now()
-        cleanup_error = close_kernel_session(jupyter, websocket, session_id)
+        cleanup_error = close_kernel_session(
+            jupyter,
+            websocket,
+            session_id,
+            args.retry_delay_seconds,
+        )
         if cleanup_error:
             run_error = f"{run_error}; {cleanup_error}" if run_error else cleanup_error
 

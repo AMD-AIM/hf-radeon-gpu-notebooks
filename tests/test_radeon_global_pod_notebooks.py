@@ -355,6 +355,48 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
             ):
                 client.create("org/model")
 
+    def test_create_waits_for_a_prior_pod_that_is_still_deleting(self):
+        client = self.client()
+        with (
+            mock.patch.object(
+                client,
+                "current",
+                side_effect=[
+                    {"status": "reconciling", "instance_id": "prior"},
+                    {"status": "not_found"},
+                ],
+            ),
+            mock.patch.object(client, "wait_deleted") as wait_deleted,
+            mock.patch.object(
+                client,
+                "_request",
+                return_value={"status": "allocating"},
+            ) as request,
+        ):
+            client.create("org/model")
+
+        wait_deleted.assert_called_once_with(600, 5)
+        self.assertEqual(request.call_args.args, ("POST",))
+
+    def test_wait_deleted_retries_a_transient_status_request_failure(self):
+        client = self.client()
+        with (
+            mock.patch.object(
+                client,
+                "current",
+                side_effect=[
+                    RUNNER.RadeonPodError("temporary disconnect"),
+                    {"status": "terminating"},
+                    {"status": "not_found"},
+                ],
+            ) as current,
+            mock.patch.object(RUNNER.time, "sleep") as sleep,
+        ):
+            client.wait_deleted(30, 0)
+
+        self.assertEqual(current.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_cleanup_refuses_to_delete_a_different_instance(self):
         client = self.client()
         with tempfile.TemporaryDirectory() as directory:
@@ -448,6 +490,27 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
 
 
 class CellRetryTests(unittest.TestCase):
+    def test_session_cleanup_retries_transient_jupyter_route_failures(self):
+        jupyter = FakeJupyter()
+        jupyter.delete_session = mock.Mock(
+            side_effect=[
+                RUNNER.JupyterAPIError("route unavailable"),
+                RUNNER.JupyterAPIError("route unavailable"),
+                None,
+            ]
+        )
+        with mock.patch.object(RUNNER.time, "sleep") as sleep:
+            error = RUNNER.close_kernel_session(
+                jupyter,
+                FakeSocket(),
+                "session-1",
+                retry_delay_seconds=5,
+            )
+
+        self.assertIsNone(error)
+        self.assertEqual(jupyter.delete_session.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
+
     def test_execute_request_waits_for_reply_and_idle_and_collects_output(self):
         socket = ProtocolSocket()
 
@@ -580,8 +643,40 @@ class CellRetryTests(unittest.TestCase):
             ["state-setup", "model-cell", "state-setup", "model-cell", "tail"],
         )
         self.assertEqual(result.kernel_session_attempts, 2)
+        self.assertEqual(result.attempts_by_cell, {0: 2, 1: 1, 2: 1})
         self.assertIsNone(result.run_error)
         self.assertEqual(result.errors_by_cell, {})
+
+    def test_kernel_loss_stops_if_the_old_session_cannot_be_deleted(self):
+        jupyter = FakeJupyter()
+        jupyter.delete_session = mock.Mock(
+            side_effect=RUNNER.JupyterAPIError("route unavailable")
+        )
+        calls = []
+
+        def execute(_socket, code, *_args):
+            calls.append(code)
+            if code == "model-cell":
+                raise RUNNER.JupyterAPIError("kernel channel closed")
+            return success_result(1)
+
+        with (
+            mock.patch.object(RUNNER, "execute_cell", side_effect=execute),
+            mock.patch.object(RUNNER, "SESSION_CLEANUP_ATTEMPTS", 2),
+            mock.patch.object(RUNNER.time, "sleep"),
+        ):
+            result = RUNNER.execute_remote_notebook(
+                jupyter,
+                "cloud/model.ipynb",
+                notebook("setup-cell", "model-cell", "must-not-run"),
+                args(),
+                lambda *_: None,
+            )
+
+        self.assertEqual(calls, ["setup-cell", "model-cell"])
+        self.assertEqual(jupyter.sessions, 1)
+        self.assertEqual(jupyter.delete_session.call_count, 2)
+        self.assertIn("session cleanup failed after 2 attempts", result.run_error)
 
     def test_kernel_transport_failure_is_not_reported_as_a_passed_cell(self):
         jupyter = FakeJupyter()
