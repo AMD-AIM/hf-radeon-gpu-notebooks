@@ -127,6 +127,22 @@ class ExistingTransformTests(unittest.TestCase):
         self.assertIn("gc.collect()", second)
         self.assertIn("torch.cuda.empty_cache()", second)
 
+    def test_patch_leaves_device_map_policy_untouched(self) -> None:
+        document = notebook(
+            code('pipe = pipeline("text-generation", model="org/model")'),
+            code(
+                'model = AutoModel.from_pretrained('
+                '"org/model", device_map="auto")'
+            ),
+        )
+
+        patched = notebook_hack.patch_notebook(document)
+
+        self.assertNotIn("device_map", cell_source(patched["cells"][0]))
+        self.assertIn(
+            'device_map="auto"', cell_source(patched["cells"][1])
+        )
+
     def test_kernelspec_and_remote_inference_trim(self) -> None:
         document = notebook(
             code("local = True"),
@@ -217,7 +233,7 @@ class NotebookFileInterfaceTests(unittest.TestCase):
             self.assertEqual(json.loads(input_path.read_text()), original)
             hacked = json.loads(output_path.read_text())
             self.assertIn("huggingface.co", cell_source(hacked["cells"][0]))
-            self.assertIn('device_map="cuda"', cell_source(hacked["cells"][1]))
+            self.assertNotIn("device_map", cell_source(hacked["cells"][1]))
 
     def test_default_is_in_place_and_backward_alias_still_works(self) -> None:
         for operation in (

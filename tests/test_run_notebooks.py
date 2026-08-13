@@ -288,7 +288,7 @@ class NotebookNormalizationTests(unittest.TestCase):
         artifact = RUNNER.build_artifact_notebook(notebook, normalized)
 
         self.assertIn("https://huggingface.co/org/model", normalized_markdown)
-        self.assertIn('device_map="cuda"', normalized_code)
+        self.assertNotIn("device_map", normalized_code)
         self.assertIsInstance(normalized["cells"][0]["source"], str)
         self.assertIsInstance(normalized["cells"][1]["source"], str)
         self.assertEqual(notebook["metadata"]["kernelspec"]["name"], "custom-kernel")

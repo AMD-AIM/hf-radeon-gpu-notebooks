@@ -256,8 +256,8 @@ def patch_notebook(nb: dict) -> dict:
     """Patch a notebook dict in place and return it.
 
     Applies, in order: kernelspec normalization, canonical model-page links in
-    markdown, device_map injection and double-load VRAM cleanup into code cells,
-    and the remote-inference trim.
+    markdown, double-load VRAM cleanup in code cells, and the remote-inference
+    trim.  The device_map transform is retained below but deliberately disabled.
     """
     # Force the python3 kernel so the pod's ipykernel is used.
     nb.setdefault("metadata", {})["kernelspec"] = {
@@ -279,7 +279,10 @@ def patch_notebook(nb: dict) -> dict:
         src = cell.get("source", "")
         if isinstance(src, list):
             src = "".join(src)
-        src = inject_device_map(src)
+        # Disabled by policy: forcing device_map="cuda" can make models that fit
+        # with their notebook-provided device_map="auto" fail on a 48 GiB GPU.
+        # Keep the helper available for a future explicit opt-in.
+        # src = inject_device_map(src)
         src = fix_diffusers_dtype(src)
         if (
             prev_cell_used_pipeline
