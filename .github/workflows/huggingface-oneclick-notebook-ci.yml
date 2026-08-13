@@ -20,9 +20,6 @@ concurrency:
 
 jobs:
   run-notebooks:
-    # TEMPORARY: keep Radeon Global CI inert while the backend bug is fixed.
-    # Revert the dedicated disable commit to resume this job.
-    if: ${{ false }}
     # The controller keeps the existing long-running self-hosted budget, but
     # uses only an isolated, CPU-only Docker container on this runner. Model
     # code and the workaround image run in the remote Radeon Global Pod.
