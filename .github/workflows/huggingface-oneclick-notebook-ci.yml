@@ -29,12 +29,11 @@ jobs:
     runs-on: [self-hosted, rocm, w7900]
     timeout-minutes: 2880
     env:
-      HF_ENDPOINT: http://134.199.133.77
       RADEON_USER_NAME: zli10002@amd.com
       RADEON_CONTROLLER_IMAGE: crpi-ygzb1jbfyj9pjrm6.cn-shenzhen.personal.cr.aliyuncs.com/images_hana/hf-oneclick-radeon-global-controller:latest
       RADEON_CONTROLLER_NAME: hf-ci-radeon-global-controller-${{ github.run_id }}
       RADEON_NOTEBOOK_API: https://radeon-global.anruicloud.com/api/service/notebooks
-      RADEON_POD_IMAGE: 10.5.10.12:1808/radeon-cloud-global/huaggingface_for_amd_radeon:20260711_workaround_fix_torch_streaming
+      RADEON_POD_IMAGE: 10.5.10.12:1808/radeon-cloud-global/huaggingface_for_amd_radeon:20260812
       RADEON_POD_STATE: .radeon-pod-ci-state.json
 
     steps:

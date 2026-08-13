@@ -181,6 +181,13 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
             r"^hf-oneclick-ci-[0-9a-f-]{36}$",
         )
 
+    def test_production_default_uses_current_image(self):
+        self.assertEqual(
+            RUNNER.DEFAULT_RADEON_IMAGE,
+            "10.5.10.12:1808/radeon-cloud-global/"
+            "huaggingface_for_amd_radeon:20260812",
+        )
+
     def test_create_uses_high_memory_resource_for_qwen3_omni(self):
         client = self.client()
         with (
@@ -279,6 +286,61 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
         self.assertEqual(jupyter.access_url, direct_url)
         sent_request = opener.open.call_args.args[0]
         self.assertEqual(sent_request.full_url, handoff_url)
+
+    def test_jupyter_client_posts_fragment_handoff_and_visits_landing_page(self):
+        handoff_url = (
+            "https://jupyter.invalid/_auth/start#request=one-time-assertion"
+        )
+        direct_url = "https://jupyter.invalid/lab/tree/model.ipynb"
+        handoff_response = mock.MagicMock()
+        handoff_response.__enter__.return_value.geturl.return_value = direct_url
+        landing_response = mock.MagicMock()
+        opener = mock.MagicMock()
+        opener.open.side_effect = [handoff_response, landing_response]
+        with mock.patch.object(
+            RUNNER.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            jupyter = RUNNER.JupyterClient(
+                handoff_url,
+                bootstrap_url=handoff_url,
+            )
+
+        self.assertEqual(jupyter.access_url, direct_url)
+        self.assertEqual(opener.open.call_count, 2)
+        handoff_request = opener.open.call_args_list[0].args[0]
+        self.assertEqual(
+            handoff_request.full_url,
+            "https://jupyter.invalid/_auth/start",
+        )
+        self.assertEqual(handoff_request.method, "POST")
+        self.assertEqual(handoff_request.data, b"request=one-time-assertion")
+        landing_request = opener.open.call_args_list[1].args[0]
+        self.assertEqual(landing_request.full_url, direct_url)
+        self.assertEqual(landing_request.get_method(), "GET")
+
+    def test_jupyter_mutation_requests_include_origin_and_referer(self):
+        opener = mock.MagicMock()
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b"{}"
+        opener.open.return_value = response
+        with mock.patch.object(
+            RUNNER.urllib.request,
+            "build_opener",
+            return_value=opener,
+        ):
+            jupyter = RUNNER.JupyterClient(
+                "https://jupyter.invalid/lab/tree/model.ipynb"
+            )
+
+        jupyter._request("POST", "sessions", {})
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_header("Origin"), "https://jupyter.invalid")
+        self.assertEqual(
+            request.get_header("Referer"),
+            "https://jupyter.invalid/lab/tree/model.ipynb",
+        )
 
     def test_create_refuses_to_replace_an_existing_user_pod(self):
         client = self.client()
@@ -708,14 +770,13 @@ class SourcePolicyTests(unittest.TestCase):
                 args(),
                 lambda *_: None,
                 kernel_environment={
-                    "HF_ENDPOINT": "http://mirror.invalid",
                     "HF_TOKEN": "hf-secret-token",
                 },
             )
 
         self.assertEqual(len(calls), 2)
-        self.assertIn("HF_ENDPOINT", calls[0])
         self.assertIn("HF_TOKEN", calls[0])
+        self.assertNotIn("HF_ENDPOINT", calls[0])
         self.assertEqual(calls[1], "print('user cell')")
         self.assertEqual(result.attempts_by_cell, {0: 1})
         self.assertEqual(cloud_notebook, original)

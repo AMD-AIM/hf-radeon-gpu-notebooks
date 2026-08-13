@@ -176,6 +176,16 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
             WORKFLOW_TEXT,
         )
 
+    def test_workflow_uses_current_pod_image_and_backend_network_defaults(self):
+        self.assertIn(
+            "RADEON_POD_IMAGE: 10.5.10.12:1808/radeon-cloud-global/"
+            "huaggingface_for_amd_radeon:20260812",
+            WORKFLOW_TEXT,
+        )
+        self.assertNotIn("134.199.133.77", WORKFLOW_TEXT)
+        self.assertNotIn("HF_ENDPOINT:", WORKFLOW_TEXT)
+        self.assertNotIn("20260711_workaround_fix_torch_streaming", WORKFLOW_TEXT)
+
     def test_self_hosted_runner_uses_only_an_isolated_controller_container(self):
         execute = step_block("Execute notebook CI")
         wrapper = (
@@ -273,6 +283,7 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
         self.assertIn("controller:test", arguments)
         self.assertNotIn("--device", arguments)
         self.assertNotIn(secret, result.stdout)
+        self.assertNotIn("HF_ENDPOINT", arguments)
 
     def test_models_are_processed_strictly_serially(self):
         controller = (REPO / "tools" / "run_radeon_pod_notebooks.py").read_text()

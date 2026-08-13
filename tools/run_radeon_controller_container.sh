@@ -20,7 +20,6 @@ fi
 
 environment_args=()
 for variable in \
-  HF_ENDPOINT \
   HF_TOKEN \
   RADEON_API_TOKEN \
   RADEON_NOTEBOOK_API \

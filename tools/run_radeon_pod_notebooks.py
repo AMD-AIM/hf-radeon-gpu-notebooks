@@ -31,12 +31,11 @@ except ModuleNotFoundError:
 DEFAULT_RADEON_API = "https://radeon-global.anruicloud.com/api/service/notebooks"
 DEFAULT_RADEON_IMAGE = (
     "10.5.10.12:1808/radeon-cloud-global/"
-    "huaggingface_for_amd_radeon:20260711_workaround_fix_torch_streaming"
+    "huaggingface_for_amd_radeon:20260812"
 )
 DEFAULT_RESOURCE_TEMPLATE = "resource-16c55g1u"
 HIGH_MEMORY_RESOURCE_TEMPLATE = "resource-16c110g1u"
 HIGH_MEMORY_MODELS = frozenset({"Qwen/Qwen3-Omni-30B-A3B-Instruct"})
-DEFAULT_HF_ENDPOINT = "http://134.199.133.77"
 STATE_FILE = Path(".radeon-pod-ci-state.json")
 CELL_EXECUTION_ATTEMPTS = 3
 KERNEL_SESSION_ATTEMPTS = 5
@@ -160,7 +159,6 @@ class RadeonPodClient:
         api_token: str,
         image: str,
         hf_token: str = "",
-        hf_endpoint: str = DEFAULT_HF_ENDPOINT,
         request_timeout: int = 60,
     ) -> None:
         self.api_url = api_url.rstrip("/")
@@ -168,7 +166,6 @@ class RadeonPodClient:
         self.api_token = api_token
         self.image = image
         self.hf_token = hf_token
-        self.hf_endpoint = hf_endpoint
         self.request_timeout = request_timeout
         common.SECRET_VALUES.add(api_token)
         if hf_token:
@@ -474,15 +471,57 @@ class JupyterClient:
         self.opener = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(self.cookie_jar)
         )
+        handoff_posted = False
 
         if bootstrap_url:
             common.SECRET_VALUES.add(bootstrap_url)
+            original_bootstrap_url = bootstrap_url
+            bootstrap_parts = urllib.parse.urlsplit(bootstrap_url)
+            handoff_fragment = urllib.parse.parse_qs(
+                bootstrap_parts.fragment,
+                keep_blank_values=True,
+            )
+            bootstrap_data = None
+            bootstrap_headers = {
+                "Accept": "text/html,application/xhtml+xml",
+                "User-Agent": "hf-oneclick-radeon-pod-ci",
+            }
+            if handoff_fragment:
+                if (
+                    len(handoff_fragment) != 1
+                    or next(iter(handoff_fragment)) not in {"request", "ticket"}
+                ):
+                    raise JupyterAPIError(
+                        "Radeon Jupyter handoff URL had an invalid fragment"
+                    )
+                handoff_field, handoff_values = next(iter(handoff_fragment.items()))
+                if len(handoff_values) != 1 or not handoff_values[0]:
+                    raise JupyterAPIError(
+                        "Radeon Jupyter handoff URL had an empty fragment"
+                    )
+                handoff_value = handoff_values[0]
+                common.SECRET_VALUES.add(handoff_value)
+                bootstrap_url = urllib.parse.urlunsplit(
+                    (
+                        bootstrap_parts.scheme,
+                        bootstrap_parts.netloc,
+                        bootstrap_parts.path,
+                        bootstrap_parts.query,
+                        "",
+                    )
+                )
+                bootstrap_data = urllib.parse.urlencode(
+                    {handoff_field: handoff_value}
+                ).encode("utf-8")
+                bootstrap_headers["Content-Type"] = (
+                    "application/x-www-form-urlencoded"
+                )
+                handoff_posted = True
             bootstrap_request = urllib.request.Request(
                 bootstrap_url,
-                headers={
-                    "Accept": "text/html,application/xhtml+xml",
-                    "User-Agent": "hf-oneclick-radeon-pod-ci",
-                },
+                data=bootstrap_data,
+                method="POST" if bootstrap_data is not None else "GET",
+                headers=bootstrap_headers,
             )
             try:
                 with self.opener.open(
@@ -502,7 +541,7 @@ class JupyterClient:
                     f"{type(exc).__name__}: "
                     f"{common.redact_secrets(str(exc))}"
                 ) from None
-            if access_url == bootstrap_url:
+            if access_url == original_bootstrap_url:
                 access_url = redirected_url
 
         parsed = urllib.parse.urlsplit(access_url)
@@ -517,6 +556,34 @@ class JupyterClient:
         self.query = parsed.query
         self.origin = f"{parsed.scheme}://{parsed.netloc}"
         self.access_url = access_url
+
+        if handoff_posted:
+            landing_request = urllib.request.Request(
+                access_url,
+                headers={
+                    "Accept": "text/html,application/xhtml+xml",
+                    "Referer": self.origin + "/_auth/start",
+                    "User-Agent": "hf-oneclick-radeon-pod-ci",
+                },
+            )
+            try:
+                with self.opener.open(
+                    landing_request,
+                    timeout=self.request_timeout,
+                ) as response:
+                    response.read()
+            except urllib.error.HTTPError as exc:
+                detail = safe_response_text(exc.read()) or exc.reason
+                raise JupyterAPIError(
+                    "Radeon Jupyter landing page failed with HTTP "
+                    f"{exc.code}: {detail}"
+                ) from None
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                raise JupyterAPIError(
+                    "Radeon Jupyter landing page failed: "
+                    f"{type(exc).__name__}: "
+                    f"{common.redact_secrets(str(exc))}"
+                ) from None
 
         common.SECRET_VALUES.add(access_url)
         for _, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
@@ -550,6 +617,9 @@ class JupyterClient:
             if cookie.name == "_xsrf":
                 headers["X-XSRFToken"] = cookie.value
                 break
+        if method not in {"GET", "HEAD"}:
+            headers["Origin"] = self.origin
+            headers["Referer"] = self.access_url
         request = urllib.request.Request(
             self._url(api_path),
             data=body,
@@ -1090,7 +1160,6 @@ def execute_remote_notebook(
                     timed_started_at = common.utc_now()
                     emit(
                         "# kernel_runtime="
-                        f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT', DEFAULT_HF_ENDPOINT)}; "
                         f"HF_TOKEN={'set' if common.runtime_hf_token() else 'missing'} "
                         "(controller configured; excluded from timing)",
                         False,
@@ -1456,8 +1525,6 @@ def run_one(
                 args,
                 emit,
                 kernel_environment={
-                    "HF_ENDPOINT": client.hf_endpoint,
-                    "HF_HUB_DISABLE_XET": "1",
                     **(
                         {
                             "HF_TOKEN": client.hf_token,
@@ -1546,7 +1613,6 @@ def build_client(args: argparse.Namespace) -> RadeonPodClient:
         api_token=token,
         image=args.radeon_image,
         hf_token=hf_token,
-        hf_endpoint=os.environ.get("HF_ENDPOINT", DEFAULT_HF_ENDPOINT),
         request_timeout=args.radeon_request_timeout,
     )
 
@@ -1649,11 +1715,7 @@ def main() -> None:
     pending = [f"radeon-pod__{target.notebook}" for target in targets]
     common.write_progress(results_dir, reports, pending)
 
-    print(
-        f"Running Radeon Pod notebook CI: targets={len(targets)}, "
-        f"HF_ENDPOINT={os.environ.get('HF_ENDPOINT', DEFAULT_HF_ENDPOINT)}",
-        flush=True,
-    )
+    print(f"Running Radeon Pod notebook CI: targets={len(targets)}", flush=True)
     for target in targets:
         run_name = f"radeon-pod__{target.notebook}"
         pending.remove(run_name)
