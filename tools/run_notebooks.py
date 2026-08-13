@@ -20,6 +20,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+try:
+    from notebook_hack import patch_notebook
+except ModuleNotFoundError:
+    # Unit tests load this file by path from the repository root, whereas the
+    # CI entry point executes it directly from tools/.
+    from tools.notebook_hack import patch_notebook
+
 
 REPO = Path(__file__).resolve().parents[1]
 TARGET_CSV = REPO / "doc" / "ci_target_models.csv"
@@ -413,16 +420,11 @@ def remote_section_decision(cell: dict[str, Any], in_remote_section: bool) -> tu
 
 def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
     normalized = copy.deepcopy(notebook)
-    in_remote_section = False
-    # Preserve the downloaded notebook's executable code. The only source
-    # cells omitted by CI are those in the Remote Inference Providers section.
+    # Preserve the downloaded notebook's executable code before the shared
+    # hack applies the Radeon-specific execution transforms below.
     cells: list[dict[str, Any]] = []
 
     for original_index, cell in enumerate(normalized.get("cells", [])):
-        drop_cell, in_remote_section = remote_section_decision(cell, in_remote_section)
-        if drop_cell:
-            continue
-
         # Rewrite only the deep-copied execution document. The downloaded
         # notebook snapshot and the repository artifact keep their original
         # source so CI never commits mirror-specific edits upstream.
@@ -441,7 +443,12 @@ def normalize_notebook(notebook: dict[str, Any]) -> dict[str, Any]:
         cells.append(cell)
 
     normalized["cells"] = cells
-    return normalized
+    # Apply Radeon execution fixes only to this deep copy.  The downloaded
+    # object used by original_notebooks snapshots and build_artifact_notebook()
+    # remains untouched.  The hack runs after endpoint rewriting so its strict
+    # Markdown Model page rule can restore only that attribution to
+    # huggingface.co while executable download URLs continue using the mirror.
+    return patch_notebook(normalized)
 
 
 def strip_ansi(text: str) -> str:

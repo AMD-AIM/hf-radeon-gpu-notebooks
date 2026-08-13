@@ -191,7 +191,7 @@ class ModelDownloadTests(unittest.TestCase):
 
 
 class NotebookNormalizationTests(unittest.TestCase):
-    def test_only_remote_inference_section_is_removed_from_notebook_code(self):
+    def test_hack_trims_everything_from_remote_inference_marker(self):
         local_before = "print('local before')"
         local_after = "print('local after')"
         remote_code = "print('remote provider call')"
@@ -222,12 +222,13 @@ class NotebookNormalizationTests(unittest.TestCase):
 
         self.assertEqual(
             ["".join(cell.get("source", [])) for cell in normalized_code],
-            [local_before, local_after],
+            [local_before],
         )
         self.assertEqual(
-            normalized["metadata"]["kernelspec"],
-            notebook["metadata"]["kernelspec"],
+            normalized["metadata"]["kernelspec"]["name"],
+            "python3",
         )
+        self.assertEqual(notebook["metadata"]["kernelspec"], {"name": "python3"})
         normalized_code[0]["outputs"] = [
             {"output_type": "stream", "name": "stdout", "text": "fresh"}
         ]
@@ -247,7 +248,7 @@ class NotebookNormalizationTests(unittest.TestCase):
             {
                 "cell_type": "markdown",
                 "metadata": {},
-                "source": "Model: https://huggingface.co/org/model",
+                "source": "Model page: https://huggingface.co/org/model",
             },
             code_cell(
                 "url = 'https://huggingface.co/org/model/resolve/main/config.json'"
@@ -262,10 +263,36 @@ class NotebookNormalizationTests(unittest.TestCase):
             "".join(cell.get("source", [])) for cell in notebook["cells"]
         ]
 
-        self.assertTrue(all("huggingface.co" not in source for source in normalized_sources))
-        self.assertTrue(all("hf-mirror.com" in source for source in normalized_sources))
+        self.assertIn("huggingface.co", normalized_sources[0])
+        self.assertNotIn("hf-mirror.com", normalized_sources[0])
+        self.assertIn("hf-mirror.com", normalized_sources[1])
+        self.assertNotIn("huggingface.co", normalized_sources[1])
         self.assertTrue(all("huggingface.co" in source for source in original_sources))
         self.assertTrue(all("hf-mirror.com" not in source for source in original_sources))
+
+    def test_full_hack_changes_only_execution_copy_and_not_artifact_source(self):
+        model_load = 'model = AutoModel.from_pretrained("org/model")'
+        notebook = notebook_document(
+            {
+                "cell_type": "markdown",
+                "metadata": {},
+                "source": "Model page: https://hf-mirror.com/org/model",
+            },
+            code_cell(model_load),
+            metadata={"kernelspec": {"name": "custom-kernel"}},
+        )
+
+        normalized = RUNNER.normalize_notebook(notebook)
+        normalized_markdown = "".join(normalized["cells"][0]["source"])
+        normalized_code = "".join(normalized["cells"][1]["source"])
+        artifact = RUNNER.build_artifact_notebook(notebook, normalized)
+
+        self.assertIn("https://huggingface.co/org/model", normalized_markdown)
+        self.assertIn('device_map="cuda"', normalized_code)
+        self.assertEqual(notebook["metadata"]["kernelspec"]["name"], "custom-kernel")
+        self.assertEqual("".join(notebook["cells"][1]["source"]), model_load)
+        self.assertEqual("".join(artifact["cells"][1]["source"]), model_load)
+        self.assertNotIn("device_map", "".join(artifact["cells"][1]["source"]))
 
     def test_mirror_download_keeps_canonical_repository_snapshot(self):
         notebook = notebook_document(
@@ -318,13 +345,15 @@ class NotebookNormalizationTests(unittest.TestCase):
         self.assertNotIn("hf-mirror.com", saved_source)
         self.assertIn("Remote Inference via Inference Providers", saved_source)
         self.assertIn("remote provider call", saved_source)
-        self.assertIn("hf-mirror.com", normalized["cells"][0]["source"])
+        self.assertIn(
+            "hf-mirror.com", "".join(normalized["cells"][0]["source"])
+        )
         normalized_source = "\n".join(
             "".join(cell.get("source", [])) for cell in normalized["cells"]
         )
         self.assertNotIn("Remote Inference via Inference Providers", normalized_source)
         self.assertNotIn("remote provider call", normalized_source)
-        self.assertIn("local inference", normalized_source)
+        self.assertNotIn("local inference", normalized_source)
 
 
 class SummaryTests(unittest.TestCase):
