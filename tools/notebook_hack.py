@@ -272,7 +272,7 @@ def patch_notebook(nb: dict) -> dict:
             markdown = cell.get("source", "")
             if isinstance(markdown, list):
                 markdown = "".join(markdown)
-            cell["source"] = [fix_mirrored_model_page(markdown)]
+            cell["source"] = fix_mirrored_model_page(markdown)
             continue
         if cell.get("cell_type") != "code":
             continue
@@ -288,7 +288,7 @@ def patch_notebook(nb: dict) -> dict:
         ):
             src = free_vram_before_reload(src)
         prev_cell_used_pipeline = "pipeline(" in src
-        cell["source"] = [src]
+        cell["source"] = src
 
     # Trim everything from the first remote/serverless-inference markdown cell
     # onward. Only markdown cells are checked to avoid false positives from code

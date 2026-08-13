@@ -289,6 +289,8 @@ class NotebookNormalizationTests(unittest.TestCase):
 
         self.assertIn("https://huggingface.co/org/model", normalized_markdown)
         self.assertIn('device_map="cuda"', normalized_code)
+        self.assertIsInstance(normalized["cells"][0]["source"], str)
+        self.assertIsInstance(normalized["cells"][1]["source"], str)
         self.assertEqual(notebook["metadata"]["kernelspec"]["name"], "custom-kernel")
         self.assertEqual("".join(notebook["cells"][1]["source"]), model_load)
         self.assertEqual("".join(artifact["cells"][1]["source"]), model_load)
