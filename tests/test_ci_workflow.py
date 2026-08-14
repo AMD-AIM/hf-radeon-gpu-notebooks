@@ -209,6 +209,7 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
         self.assertIn("        if: always()", cleanup)
         self.assertIn("--cleanup-state", cleanup)
         self.assertIn('--state-file "$RADEON_POD_STATE"', cleanup)
+        self.assertIn("--delete-stability-seconds 90", cleanup)
         self.assertNotIn("results/", cleanup)
         self.assertLess(
             WORKFLOW_TEXT.index("      - name: Ensure owned Radeon Pod is deleted\n"),
@@ -280,9 +281,11 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
     def test_models_are_processed_strictly_serially(self):
         controller = (REPO / "tools" / "run_radeon_pod_notebooks.py").read_text()
 
-        self.assertIn("    for target in targets:\n", controller)
+        serial_loop = "    for target_index, target in enumerate(targets):\n"
+        self.assertIn(serial_loop, controller)
         self.assertIn(
-            "        report = run_one(target, args, results_dir, client)\n",
+            "            retain_state_after_cleanup="
+            "target_index == len(targets) - 1,\n",
             controller,
         )
         main = controller[controller.index("def main() -> None:"):]
@@ -290,7 +293,7 @@ class WorkflowRadeonGlobalBackendTests(unittest.TestCase):
         self.assertEqual(main.count(reset_call), 1)
         self.assertLess(
             main.index(reset_call),
-            main.index("    for target in targets:\n"),
+            main.index(serial_loop),
         )
         self.assertNotIn("Recover owned Pod from an interrupted run", WORKFLOW_TEXT)
         self.assertNotIn("matrix:", WORKFLOW_TEXT)

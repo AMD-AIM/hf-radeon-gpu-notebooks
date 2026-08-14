@@ -397,6 +397,67 @@ class RadeonGlobalPodAPITests(unittest.TestCase):
         self.assertEqual(current.call_count, 3)
         self.assertEqual(sleep.call_count, 2)
 
+    def test_wait_deleted_requires_stable_not_found_after_status_rebound(self):
+        client = self.client()
+        with (
+            mock.patch.object(
+                client,
+                "current",
+                side_effect=[
+                    {"status": "not_found"},
+                    {"status": "ready", "instance_id": "rebounded"},
+                    {"status": "not_found"},
+                    {"status": "not_found"},
+                    {"status": "not_found"},
+                ],
+            ) as current,
+            mock.patch.object(RUNNER.time, "sleep") as sleep,
+            mock.patch.object(
+                RUNNER.time,
+                "monotonic",
+                side_effect=[0.0, 1.0, 1.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0],
+            ),
+        ):
+            client.wait_deleted(30, 0, stability_seconds=2)
+
+        self.assertEqual(current.call_count, 5)
+        self.assertEqual(sleep.call_count, 4)
+
+    def test_cleanup_can_retain_owned_state_for_final_verification(self):
+        client = self.client()
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            RUNNER.write_owned_state(
+                state,
+                user_name=client.user_name,
+                model_id="org/model",
+                instance_id="owned-instance",
+            )
+            with mock.patch.object(
+                RUNNER,
+                "cleanup_matching_current_pod",
+                return_value=4.0,
+            ) as cleanup:
+                elapsed = RUNNER.cleanup_owned_pod(
+                    client,
+                    state,
+                    600,
+                    5,
+                    remove_state=False,
+                    stability_seconds=90,
+                )
+
+            self.assertTrue(state.exists())
+
+        self.assertEqual(elapsed, 4.0)
+        cleanup.assert_called_once_with(
+            client,
+            "owned-instance",
+            600,
+            5,
+            stability_seconds=90,
+        )
+
     def test_cleanup_refuses_to_delete_a_different_instance(self):
         client = self.client()
         with tempfile.TemporaryDirectory() as directory:

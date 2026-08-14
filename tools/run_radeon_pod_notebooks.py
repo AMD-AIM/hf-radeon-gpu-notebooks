@@ -344,10 +344,16 @@ class RadeonPodClient:
             time.sleep(poll_seconds)
             current = self.current()
 
-    def wait_deleted(self, timeout: float, poll_seconds: float) -> None:
+    def wait_deleted(
+        self,
+        timeout: float,
+        poll_seconds: float,
+        stability_seconds: float = 0.0,
+    ) -> None:
         deadline = time.monotonic() + timeout
         last_status = ""
         last_error = ""
+        not_found_since: float | None = None
         while True:
             try:
                 current = self.current()
@@ -363,7 +369,13 @@ class RadeonPodClient:
                     print(f"[POD] delete status={status or 'unknown'}", flush=True)
                     last_status = status
                 if status == "not_found":
-                    return
+                    now = time.monotonic()
+                    if not_found_since is None:
+                        not_found_since = now
+                    if now - not_found_since >= stability_seconds:
+                        return
+                else:
+                    not_found_since = None
             if time.monotonic() >= deadline:
                 detail = (
                     f", last error={last_error}"
@@ -414,6 +426,9 @@ def cleanup_owned_pod(
     state_path: Path,
     delete_timeout: float,
     poll_seconds: float,
+    *,
+    remove_state: bool = True,
+    stability_seconds: float = 0.0,
 ) -> float:
     state = read_owned_state(state_path)
     if state is None:
@@ -428,8 +443,10 @@ def cleanup_owned_pod(
         str(state.get("instance_id") or ""),
         delete_timeout,
         poll_seconds,
+        stability_seconds=stability_seconds,
     )
-    state_path.unlink(missing_ok=True)
+    if remove_state:
+        state_path.unlink(missing_ok=True)
     return elapsed
 
 
@@ -438,10 +455,18 @@ def cleanup_matching_current_pod(
     expected_instance: str,
     delete_timeout: float,
     poll_seconds: float,
+    *,
+    stability_seconds: float = 0.0,
 ) -> float:
     started = time.monotonic()
     current = client.current()
     if response_status(current) == "not_found":
+        if stability_seconds:
+            client.wait_deleted(
+                delete_timeout,
+                poll_seconds,
+                stability_seconds=stability_seconds,
+            )
         return round(time.monotonic() - started, 3)
 
     current_instance = response_instance_id(current) or ""
@@ -452,7 +477,11 @@ def cleanup_matching_current_pod(
         )
 
     client.delete_current()
-    client.wait_deleted(delete_timeout, poll_seconds)
+    client.wait_deleted(
+        delete_timeout,
+        poll_seconds,
+        stability_seconds=stability_seconds,
+    )
     return round(time.monotonic() - started, 3)
 
 
@@ -1506,6 +1535,8 @@ def run_one(
     args: argparse.Namespace,
     results_dir: Path,
     client: RadeonPodClient,
+    *,
+    retain_state_after_cleanup: bool = False,
 ) -> dict[str, Any]:
     artifact_name = f"radeon-pod__{target.notebook}"
     log_path = results_dir / artifact_name.replace(".ipynb", ".log")
@@ -1619,6 +1650,7 @@ def run_one(
                         state_path,
                         args.pod_delete_timeout,
                         args.pod_poll_seconds,
+                        remove_state=not retain_state_after_cleanup,
                     )
                     emit(f"# pod_delete={pod_delete_elapsed}s (excluded)")
                 except RadeonPodError as exc:
@@ -1716,6 +1748,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pod-ready-timeout", type=int, default=1800)
     parser.add_argument("--pod-delete-timeout", type=int, default=600)
     parser.add_argument("--pod-poll-seconds", type=float, default=5.0)
+    parser.add_argument(
+        "--delete-stability-seconds",
+        type=float,
+        default=0.0,
+        help="require /current to remain not_found for this long during cleanup",
+    )
     parser.add_argument("--jupyter-ready-timeout", type=int, default=300)
     parser.add_argument("--jupyter-request-timeout", type=int, default=60)
     parser.add_argument("--radeon-request-timeout", type=int, default=60)
@@ -1752,6 +1790,7 @@ def main() -> None:
             state_path,
             args.pod_delete_timeout,
             args.pod_poll_seconds,
+            stability_seconds=args.delete_stability_seconds,
         )
         return
 
@@ -1781,7 +1820,7 @@ def main() -> None:
     common.write_progress(results_dir, reports, pending)
 
     print(f"Running Radeon Pod notebook CI: targets={len(targets)}", flush=True)
-    for target in targets:
+    for target_index, target in enumerate(targets):
         run_name = f"radeon-pod__{target.notebook}"
         pending.remove(run_name)
         print(
@@ -1793,7 +1832,13 @@ def main() -> None:
             flush=True,
         )
         common.write_progress(results_dir, reports, pending, running=run_name)
-        report = run_one(target, args, results_dir, client)
+        report = run_one(
+            target,
+            args,
+            results_dir,
+            client,
+            retain_state_after_cleanup=target_index == len(targets) - 1,
+        )
         reports.append(report)
         common.write_summary(results_dir, reports, policy)
         common.write_progress(results_dir, reports, pending)
