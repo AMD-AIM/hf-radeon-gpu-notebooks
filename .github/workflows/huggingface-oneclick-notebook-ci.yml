@@ -7,14 +7,19 @@ on:
       targets:
         description: 'Ordered JSON list containing "radeon-global" and/or "local-machine"'
         required: false
-        default: '["radeon-global","local-machine"]'
+        default: '["radeon-global"]'
         type: string
+      allow_local_machine:
+        description: "Explicitly allow dispatch to the local W7900D"
+        required: false
+        default: false
+        type: boolean
       filter:
         description: "Forwarded substring filter (blank = all)"
         required: false
         default: ""
       use_runner_hf_cache:
-        description: "Forwarded cache mode"
+        description: "Forwarded cache mode for local-machine"
         required: false
         default: "true"
         type: choice
@@ -40,10 +45,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TARGETS: ${{ inputs.targets }}
           INPUT_FILTER: ${{ inputs.filter }}
+          INPUT_ALLOW_LOCAL_MACHINE: ${{ inputs.allow_local_machine }}
           INPUT_USE_RUNNER_HF_CACHE: ${{ inputs.use_runner_hf_cache }}
           TARGET_WORKFLOW: huggingface-oneclick-notebook-ci.yml
         run: |
-          TARGETS_JSON="${INPUT_TARGETS:-[\"radeon-global\",\"local-machine\"]}"
+          TARGETS_JSON="${INPUT_TARGETS:-[\"radeon-global\"]}"
           if ! TARGET_LINES="$(
             python3 -c '
           import json
@@ -69,6 +75,21 @@ jobs:
           fi
 
           mapfile -t TARGETS <<<"$TARGET_LINES"
+          if [ "$INPUT_ALLOW_LOCAL_MACHINE" != "true" ]; then
+            FILTERED_TARGETS=()
+            for TARGET in "${TARGETS[@]}"; do
+              if [ "$TARGET" = "local-machine" ]; then
+                echo "::notice::Skipping local-machine. Enable allow_local_machine for an explicit manual W7900D run."
+              else
+                FILTERED_TARGETS+=("$TARGET")
+              fi
+            done
+            TARGETS=("${FILTERED_TARGETS[@]}")
+          fi
+          if [ "${#TARGETS[@]}" -eq 0 ]; then
+            exit 0
+          fi
+
           for TARGET_INDEX in "${!TARGETS[@]}"; do
             TARGET="${TARGETS[$TARGET_INDEX]}"
             case "$TARGET" in
