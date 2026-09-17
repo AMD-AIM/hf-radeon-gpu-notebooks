@@ -92,6 +92,18 @@ def card_index_from_key(key: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+def parse_card_indices(value: str) -> set[int]:
+    indices: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if not item.isdigit():
+            raise ValueError(f"invalid card index: {item!r}")
+        indices.add(int(item))
+    return indices
+
+
 def discover_render_nodes(allowed: str = "") -> list[RenderNode]:
     allowed_names = {
         Path(item.strip()).name
@@ -251,9 +263,12 @@ def collect_candidates(
     by_index: dict[int, GpuStats],
     args: argparse.Namespace,
 ) -> list[Candidate]:
+    allowed_card_indices = parse_card_indices(args.allowed_card_indices)
     candidates: list[Candidate] = []
     for fallback_index, node in enumerate(nodes):
         stats = by_bus.get(node.pci_bus or "") or by_index.get(fallback_index) or GpuStats()
+        if allowed_card_indices and stats.card_index not in allowed_card_indices:
+            continue
         lock_file = lock_file_for(Path(args.lock_dir), node)
         locked = lock_file.exists() and not lock_is_stale(lock_file, args.stale_lock_seconds)
         pids = pids_using_node(node.path)
@@ -316,6 +331,9 @@ def select_once(args: argparse.Namespace, owner: dict[str, Any]) -> Candidate | 
         raise RuntimeError(f"no AMD render nodes found{allowed}")
     by_bus, by_index = parse_rocm_smi(run_rocm_smi_json())
     candidates = collect_candidates(nodes, by_bus, by_index, args)
+    if not candidates:
+        allowed = args.allowed_card_indices or "the configured constraints"
+        raise RuntimeError(f"no Radeon GPU candidates matched allowed card indices: {allowed}")
     print_candidates(candidates)
     for candidate in sorted((c for c in candidates if c.idle), key=candidate_sort_key):
         if args.no_lock or try_lock(candidate.lock_file, args.stale_lock_seconds, owner):
@@ -395,6 +413,11 @@ def self_test() -> int:
         if not idle or idle[0].node.name != "renderD130":
             print("self-test failed: expected renderD130", file=sys.stderr)
             return 1
+        args.allowed_card_indices = "0,1"
+        restricted = collect_candidates(nodes, by_bus, {}, args)
+        if {candidate.stats.card_index for candidate in restricted} != {0, 1}:
+            print("self-test failed: card index constraint was not applied", file=sys.stderr)
+            return 1
         print_candidates(candidates)
     print("self-test passed")
     return 0
@@ -407,6 +430,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--wait-seconds", type=int, default=3600)
     ap.add_argument("--poll-seconds", type=int, default=30)
     ap.add_argument("--allowed-render-nodes", default=os.environ.get("RADEON_CI_RENDER_NODES", ""))
+    ap.add_argument(
+        "--allowed-card-indices",
+        default=os.environ.get("RADEON_CI_GPU_CARD_INDICES", ""),
+        help="Comma-separated rocm-smi card indices eligible for selection",
+    )
     ap.add_argument("--lock-dir", default=str(DEFAULT_LOCK_DIR))
     ap.add_argument("--stale-lock-seconds", type=int, default=72 * 3600)
     ap.add_argument("--github-output", default=os.environ.get("GITHUB_OUTPUT", ""))

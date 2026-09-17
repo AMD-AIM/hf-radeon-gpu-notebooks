@@ -16,8 +16,9 @@ on:
         options:
           - "true"
           - "false"
-  push:
-    branches: [hf_oneclick_local_machine]
+  # Keep the W7900D workflow manual-only. Regular CI runs on Radeon Global.
+  # push:
+  #   branches: [hf_oneclick_local_machine]
 
 permissions:
   contents: write
@@ -77,6 +78,7 @@ jobs:
         id: select_gpu
         run: |
           python3 tools/select_idle_rocm_gpu.py \
+            --allowed-card-indices "0,1,2,3" \
             --max-used-gb "${RADEON_CI_GPU_MAX_USED_GB:-2}" \
             --max-util-pct "${RADEON_CI_GPU_MAX_UTIL_PCT:-5}" \
             --wait-seconds "${RADEON_CI_GPU_WAIT_SECONDS:-3600}" \

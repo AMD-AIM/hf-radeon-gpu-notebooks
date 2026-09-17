@@ -160,10 +160,12 @@ class WorkflowIdentityTests(unittest.TestCase):
                 'run-name: "[Run] Local Machine CI"\n'
             )
         )
-        self.assertIn(
-            "  push:\n    branches: [hf_oneclick_local_machine]\n",
-            WORKFLOW_TEXT,
-        )
+        self.assertIn("  workflow_dispatch:\n", WORKFLOW_TEXT)
+        self.assertNotIn("\n  push:\n", WORKFLOW_TEXT)
+        self.assertNotIn("\n  schedule:\n", WORKFLOW_TEXT)
+
+        select_gpu = step_block("Select idle Radeon GPU")
+        self.assertIn('--allowed-card-indices "0,1,2,3"', select_gpu)
 
 
 class WorkflowCacheConfigurationTests(unittest.TestCase):
